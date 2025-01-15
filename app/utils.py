@@ -200,6 +200,7 @@ def save_results_to_db(header_info, results_data, file_info):
        return False, str(e)
 
 def save_file(file):
+    """saving the file to the upload folder. This may be removed later since we are apporaching this based on database not file system"""
     if not file or not allowed_file(file.filename):
         return None, "Invalid file format"
     filename = secure_filename(file.filename)
