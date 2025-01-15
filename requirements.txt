@@ -9,3 +9,9 @@ Jinja2==3.1.4
 click==8.1.7
 python-dotenv==1.0.1
 redis==5.2.1
+pypdf==5.1.0
+PyJWT==2.10.0
+python-docx==1.1.2
+docx==0.2.4
+flask-swagger-ui==4.11.1
+pillow==11.0.0
