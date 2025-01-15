@@ -5,7 +5,7 @@ import csv
 from openpyxl import load_workbook
 from datetime import datetime
 
-import tabula
+# import tabula
 from typing import Tuple, Dict, List
 import re
 
