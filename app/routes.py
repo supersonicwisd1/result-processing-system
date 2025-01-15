@@ -527,6 +527,14 @@ class Protected(Resource):
             "role": user.role
         }, 200
 
+# Health Check Route
+@api.route('/health')
+class Health(Resource):
+    @api.response(200, 'Server is healthy')
+    def get(self):
+        """Test health check route"""
+        return {"message": "Server is healthy"}, 200
+
 
 # Configure JWT for Swagger
 authorizations = {
