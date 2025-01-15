@@ -43,7 +43,7 @@ def create_app():
         return str(user) if isinstance(user, int) else user
     
     # Initialize API with app directly
-    from .routes import api
+    from app.routes import api
     api.init_app(app)
 
     with app.app_context():
