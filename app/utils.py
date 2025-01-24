@@ -4,7 +4,7 @@ from docx import Document
 from openpyxl import load_workbook
 import csv
 from flask import jsonify, current_app
-from .models import User, Course, Semester, Student, Result
+from .models import User, Course, Semester, Student, Result, Score
 from . import db
 from datetime import datetime
 import os
@@ -26,13 +26,19 @@ def calc_point(grade, course_unit):
     return grade_points.get(grade, 0) * course_unit
 
 def create_error_response(message, status_code=400):
-    return jsonify({"error": message}), status_code
+    response = jsonify({"error": message})
+    response.status_code = status_code
+    return response
+
 
 def get_user_by_id(user_id):
     return User.query.get(user_id)
 
 def get_user_by_username(username):
     return User.query.filter_by(username=username).first()
+
+def get_user_by_email(email):
+    return User.query.filter_by(email=email).first()
 
 def get_student_by_registration(registration_number):
     return Student.query.filter_by(registration_number=registration_number).first()
@@ -44,13 +50,13 @@ def check_required_fields(data, required_fields):
     return None
 
 def get_or_create_course(data):
-    course = Course.query.filter_by(code=data['course_code']).first()
+    course = Course.query.filter_by(code=data['code']).first()
     if not course:
         course = Course(
-            code=data['course_code'],
-            title=data['course_title'],
-            unit=data['course_unit'],
-            department=data['exam_department'],
+            code=data['code'],
+            title=data['title'],
+            unit=data['unit'],
+            department=data['department'],
             faculty=data['faculty'],
             level=data['level']
         )
@@ -110,94 +116,104 @@ def process_result(result_data, course, semester, lecturer_id):
     return None
 
 def process_uploaded_file(filepath):
+    """Process an uploaded file to extract results."""
     try:
-        if filepath.endswith('.xlsx'):
-            return extract_xlsx_data(filepath), "XLSX file processed"
-        elif filepath.endswith('.docx'):
+        ext = os.path.splitext(filepath)[-1].lower()
+        if ext == ".docx":
             return extract_docx_data(filepath), "DOCX file processed"
-        elif filepath.endswith('.pdf'):
+        elif ext == ".pdf":
             return extract_pdf_data(filepath), "PDF file processed"
-        elif filepath.endswith('.csv'):
+        elif ext == ".csv":
             return extract_csv_data(filepath), "CSV file processed"
+        elif ext == ".xlsx":
+            return extract_xlsx_data(filepath), "XLSX file processed"
         else:
-            return None, "Unsupported file format"
-            
+            return None, "Unsupported file format"  
     except Exception as e:
         return None, str(e)
 
 def save_results_to_db(header_info, results_data, file_info):
-   try:
-       # Get or create course
-       course = Course.query.filter_by(code=header_info['course_code']).first()
-       if not course:
-           course = Course(
-               code=header_info['course_code'],
-               title=header_info['course_title'],
-               unit=header_info['course_unit'],
-               department=header_info['department'],
-               faculty=header_info['faculty'],
-               level='100'
-           )
-           db.session.add(course)
-           db.session.flush()
+    try:
+        # Get or create course
+        course = Course.query.filter_by(code=header_info['course_code']).first()
+        if not course:
+            course = Course(
+                code=header_info['course_code'],
+                title=header_info['course_title'],
+                unit=header_info['course_unit'],
+                department=header_info['department'],
+                faculty=header_info['faculty'],
+                level='100'
+            )
+            db.session.add(course)
+            db.session.flush()
 
-       # Get or create semester
-       semester_name = f"{header_info['session']} {header_info['semester']}"
-       semester = Semester.query.filter_by(name=semester_name).first()
-       if not semester:
-           semester = Semester(name=semester_name)
-           db.session.add(semester)
-           db.session.flush()
+        # Get or create semester
+        semester_name = f"{header_info['session']} {header_info['semester']}"
+        semester = Semester.query.filter_by(name=semester_name).first()
+        if not semester:
+            semester = Semester(name=semester_name)
+            db.session.add(semester)
+            db.session.flush()
 
-       # Process each result
-       for result in results_data:
-           # Get or create student
-           student = Student.query.filter_by(
-               registration_number=result['registration_number']
-           ).first()
-           
-           if not student:
-               student = Student(
-                   registration_number=result['registration_number'],
-                   name=result['name'],
-                   department=result['department']
-               )
-               db.session.add(student)
-               db.session.flush()
+        # Process each result
+        for result in results_data:
+            # Get or create student
+            student = Student.query.filter_by(
+                registration_number=result['registration_number']
+            ).first()
+            
+            if not student:
+                student = Student(
+                    registration_number=result['registration_number'],
+                    name=result['name'],
+                    department=result['department']
+                )
+                db.session.add(student)
+                db.session.flush()
 
-           # Create or update result
-           existing_result = Result.query.filter_by(
-               student_id=student.id,
-               course_id=course.id,
-               semester_id=semester.id
-           ).first()
+            # Create or update result metadata
+            result_metadata = Result.query.filter_by(
+                student_id=student.id,
+                course_id=course.id,
+                semester_id=semester.id
+            ).first()
 
-           if existing_result:
-               existing_result.continuous_assessment = result['continuous_assessment']
-               existing_result.exam_score = result['exam_score']
-               existing_result.total_score = result['total_score']
-               existing_result.grade = result['grade']
-           else:
-               new_result = Result(
-                   student_id=student.id,
-                   course_id=course.id,
-                   semester_id=semester.id,
-                   continuous_assessment=result['continuous_assessment'],
-                   exam_score=result['exam_score'],
-                   total_score=result['total_score'],
-                   grade=result['grade'],
-                   original_file=file_info['filename'],
-                   upload_date=datetime.utcnow(),
-                   uploader_lecturer_id=file_info['uploader_id']
-               )
-               db.session.add(new_result)
+            if not result_metadata:
+                result_metadata = Result(
+                    student_id=student.id,
+                    course_id=course.id,
+                    semester_id=semester.id,
+                    original_file=file_info['filename'],
+                    upload_date=datetime.utcnow(),
+                    uploader_lecturer_id=file_info['uploader_id']
+                )
+                db.session.add(result_metadata)
+                db.session.flush()
 
-       db.session.commit()
-       return True, "Results saved successfully"
+            # Create or update score
+            score = Score.query.filter_by(result_id=result_metadata.id).first()
+            if score:
+                score.continuous_assessment = result['continuous_assessment']
+                score.exam_score = result['exam_score']
+                score.total_score = result['total_score']
+                score.grade = result['grade']
+            else:
+                score = Score(
+                    result_id=result_metadata.id,
+                    continuous_assessment=result['continuous_assessment'],
+                    exam_score=result['exam_score'],
+                    total_score=result['total_score'],
+                    grade=result['grade']
+                )
+                db.session.add(score)
 
-   except Exception as e:
-       db.session.rollback()
-       return False, str(e)
+        db.session.commit()
+        return True, "Results saved successfully"
+
+    except Exception as e:
+        db.session.rollback()
+        return False, str(e)
 
 def save_file(file):
     """saving the file to the upload folder. This may be removed later since we are apporaching this based on database not file system"""
@@ -208,81 +224,78 @@ def save_file(file):
     file.save(filepath)
     return filepath, None
 
-def process_results_data(results):
+def process_scores_data(scores):
     """
-    Processes student results to calculate GPA and group data by session and semester.
+    Processes student scores to calculate GPA and group data by session and semester.
 
     Args:
-        results (list): A list of result objects, where each object contains course details,
-                        grades, and associated semester information.
+        scores (list): A list of `Score` objects with their related `Result`, `Course`, and `Semester`.
 
     Returns:
         tuple: A tuple containing:
-            - grouped_results (dict): Results grouped by session and semester with GPA and course details.
+            - grouped_scores (dict): Scores grouped by session and semester with GPA and course details.
             - overall_total_credit_earned (int): Total credits earned across all sessions and semesters.
             - overall_total_grade_point (float): Total grade points across all sessions and semesters.
     """
-    grouped_results = {}
+    grouped_scores = {}
     overall_total_credit_earned = 0
     overall_total_grade_point = 0
 
-    for result in results:
-        try:
-            # Extract session and semester names
-            session_name, semester_name = result.semester.name.split(" ")
+    for score in scores:
+        # Ensure related objects are available
+        if not score.result or not score.result.course or not score.result.semester:
+            continue
 
-            # Initialize session data if not present
-            if session_name not in grouped_results:
-                grouped_results[session_name] = {
-                    "results_by_semester": {},
-                    "overall_total_credit_earned": 0,
-                    "overall_total_grade_point": 0
-                }
+        result = score.result
+        course = result.course
+        semester = result.semester
 
-            # Initialize semester data if not present
-            if semester_name not in grouped_results[session_name]["results_by_semester"]:
-                grouped_results[session_name]["results_by_semester"][semester_name] = {
-                    "total_credit_earned": 0,
-                    "total_grade_point": 0,
-                    "courses": [],
-                    "GPA": 0
-                }
+        # Extract session and semester names
+        session_name, semester_name = semester.name.split(" ")
 
-            # Calculate points for the course
-            point = calc_point(result.grade, result.course.unit)
+        # Initialize session data if not present
+        if session_name not in grouped_scores:
+            grouped_scores[session_name] = {
+                "results_by_semester": {}
+            }
 
-            # Update semester totals
-            semester_data = grouped_results[session_name]["results_by_semester"][semester_name]
-            semester_data["total_credit_earned"] += result.course.unit
-            semester_data["total_grade_point"] += point
+        # Initialize semester data if not present
+        if semester_name not in grouped_scores[session_name]["results_by_semester"]:
+            grouped_scores[session_name]["results_by_semester"][semester_name] = {
+                "total_credit_earned": 0,
+                "total_grade_point": 0,
+                "courses": [],
+                "GPA": 0
+            }
 
-            # Update overall totals
-            overall_total_credit_earned += result.course.unit
-            overall_total_grade_point += point
+        # Calculate grade points for the course
+        point = calc_point(score.grade, course.unit)
 
-            # Append course details
-            semester_data["courses"].append({
-                "course_code": result.course.code,
-                "course_title": result.course.title,
-                "course_unit": result.course.unit,
-                "level": result.course.level,
-                "semester": semester_name,
-                "continuous_assessment": result.continuous_assessment,
-                "exam_score": result.exam_score,
-                "total_score": result.total_score,
-                "grade": result.grade,
-                "point": point
-            })
+        # Update semester totals
+        semester_data = grouped_scores[session_name]["results_by_semester"][semester_name]
+        semester_data["total_credit_earned"] += course.unit
+        semester_data["total_grade_point"] += point
+        semester_data["courses"].append({
+            "course_code": course.code,
+            "course_title": course.title,
+            "course_unit": course.unit,
+            "ca_score": score.continuous_assessment,
+            "exam_score": score.exam_score,
+            "total_score": score.total_score,
+            "grade": score.grade,
+            "point": point
+        })
 
-        except AttributeError as e:
-            print(f"Error processing result: {e}")
-            continue  # Skip malformed result
+        # Update overall totals
+        overall_total_credit_earned += course.unit
+        overall_total_grade_point += point
 
     # Calculate GPA for each semester
-    for session_data in grouped_results.values():
+    for session_data in grouped_scores.values():
         for semester_name, semester_data in session_data["results_by_semester"].items():
             total_credit = semester_data["total_credit_earned"]
             total_points = semester_data["total_grade_point"]
             semester_data["GPA"] = total_points / total_credit if total_credit > 0 else 0
 
-    return grouped_results, overall_total_credit_earned, overall_total_grade_point
+    return grouped_scores, overall_total_credit_earned, overall_total_grade_point
+

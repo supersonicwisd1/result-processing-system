@@ -7,6 +7,7 @@ from config import DevelopmentConfig, ProductionConfig, TestingConfig
 import logging
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from datetime import timedelta
 
 db = SQLAlchemy()
 
@@ -33,6 +34,10 @@ def create_app():
     app.config['JWT_HEADER_TYPE'] = 'Bearer'
     app.config['JWT_HEADER_NAME'] = 'Authorization'
     app.config['JWT_IDENTITY_CLAIM'] = 'sub'
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
+    app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
+    app.config['JWT_BLACKLIST_ENABLED'] = True
+    app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ["access", "refresh"]
     
     # Rest of your configurations...
     jwt = JWTManager(app)
@@ -41,7 +46,7 @@ def create_app():
     @jwt.user_identity_loader
     def user_identity_lookup(user):
         return str(user) if isinstance(user, int) else user
-    
+
     # Initialize API with app directly
     from app.routes import api
     api.init_app(app)

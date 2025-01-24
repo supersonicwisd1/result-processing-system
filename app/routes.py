@@ -1,15 +1,24 @@
 # flask-app/app/routes.py
 import os
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from .utils import (create_error_response, get_user_by_id, get_user_by_username,
+from flask import Blueprint, request, jsonify, session
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt
+from .utils import (create_error_response, get_user_by_id, get_user_by_username, get_user_by_email,
                     get_student_by_registration, check_required_fields,
                     get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db,
-                    process_uploaded_file, process_results_data)
-from .models import User, db, Result, Student, Course, Semester
-from .constants import ALLOWED_ROLES, UPLOAD_FOLDER, ALLOWED_EXTENSIONS
+                    process_uploaded_file, process_scores_data)
+from .models import User, db, Result, Student, Course, Semester, ActionLog, TokenBlacklist, Score
+from .constants import ALLOWED_ROLES, UPLOAD_FOLDER
 from functools import wraps
 from flask_restx import Api, Resource, fields, Namespace
+import json
+from sqlalchemy.orm import joinedload
+from datetime import datetime
+
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Create API blueprint
 api_blueprint = Blueprint('api', __name__)
@@ -40,11 +49,36 @@ api.add_namespace(student_ns)
 user_model = api.model('User', {
     'username': fields.String(required=True, description='Username'),
     'password': fields.String(required=True, description='Password'),
+    'email': fields.String(required=True, description='Email'),
+    'department': fields.String(required=True, description='Department'),
     'role': fields.String(required=True, description='User role', enum=ALLOWED_ROLES)
 })
 
+change_password_model = api.model('ChangePassword', {
+    'old_password': fields.String(required=True, description='The current password'),
+    'new_password': fields.String(required=True, description='The new password to set')
+})
+
+forgot_password_model = api.model('ForgotPassword', {
+    'email': fields.String(required=True, description='The email associated with the user account')
+})
+
+reset_password_model = api.model('ResetPassword', {
+    'reset_token': fields.String(required=True, description='Token sent for password reset'),
+    'new_password': fields.String(required=True, description='The new password to set')
+})
+
+update_email_model = api.model('UpdateEmail', {
+    'new_email': fields.String(required=True, description='The new email address to update')
+})
+
+update_username_model = api.model('UpdateUsername', {
+    'new_username': fields.String(required=True, description='The new username to set')
+})
+
 login_model = api.model('Login', {
-    'username': fields.String(required=True, description='Username'),
+    'username': fields.String(required=False, description='Username'),
+    'email': fields.String(required=False, description='Email'),
     'password': fields.String(required=True, description='Password')
 })
 
@@ -55,6 +89,24 @@ student_result_model = api.model('StudentResult', {
     'total_score': fields.Float(required=True, description='Total score'),
     'grade': fields.String(required=True, description='Grade achieved')
 })
+
+score_update_model = api.model('ScoreUpdate', {
+    'registration_number': fields.String(required=True, description='Student registration number'),
+    'ca_score': fields.Float(description='Continuous assessment score'),
+    'exam_score': fields.Float(description='Exam score'),
+    'total_score': fields.Float(description='Total score'),
+    'grade': fields.String(description='Grade achieved')
+})
+
+result_update_model = api.model('ResultUpdate', {
+    'course_code': fields.String(description='Course code'),
+    'course_title': fields.String(description='Course title'),
+    'course_unit': fields.Integer(description='Course unit'),
+    'semester_name': fields.String(description='Semester name'),
+    'session': fields.String(description='Academic session'),
+    'department': fields.String(description='Department'),
+})
+
 
 result_model = api.model('Result', {
     'course_code': fields.String(required=True, description='Course code'),
@@ -103,6 +155,8 @@ class Register(Resource):
         """Register a new user with the system"""
         data = request.json
         username = data.get('username')
+        email = data.get('email')
+        department = data.get('department')
         password = data.get('password')
         role = data.get('role')
 
@@ -115,9 +169,22 @@ class Register(Resource):
         if existing_user:
             return create_error_response("User with this username already exists")
 
-        new_user = User(username=username, role=role)
+        new_user = User(username=username, role=role, email=email, department=department)
         new_user.set_password(password)
         db.session.add(new_user)
+        db.session.commit()
+
+        # Log action
+        log = ActionLog(
+            user_id=None,
+            action="register_user",
+            resource="User",
+            resource_id=new_user.id,
+            details=json.dumps({"username": username, 'email': email, "role": role}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
         db.session.commit()
 
         return {"message": "User registered successfully"}, 201
@@ -128,157 +195,555 @@ class Login(Resource):
     @auth_ns.response(200, 'Login successful')
     @auth_ns.response(401, 'Invalid credentials')
     def post(self):
+        """Login the user"""
         data = request.json
         username = data.get('username')
+        email = data.get('email')
         password = data.get('password')
 
-        if not username or not password:
-            return {"error": "Username and password required"}, 400
+        if (not username or not email) and not password:
+            return {"error": "Username or Email and Password required"}, 400
 
-        user = get_user_by_username(username)
+        user = get_user_by_username(username) if username else get_user_by_email(email)
         if user and user.check_password(password):
             access_token = create_access_token(identity=user.id)
-            return {"access_token": access_token, "role": user.role}
-        
+
+            # Log action
+            log = ActionLog(
+                user_id=user.id,
+                action="login",
+                resource="User",
+                resource_id=user.id,
+                details=json.dumps({"username": user.username}),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
+            return {"access_token": access_token, "role": user.role}, 200
+
         return {"error": "Invalid credentials"}, 401
+
+@auth_ns.route('/logout')
+class Logout(Resource):
+    @jwt_required()
+    def post(self):
+        """Logout the user by blacklisting their token"""
+        jti = get_jwt()["jti"]  # JWT ID
+        token_type = get_jwt()["type"]  # Access or Refresh
+
+        # Add the token to the blacklist
+        token = TokenBlacklist(jti=jti, token_type=token_type)
+        db.session.add(token)
+
+        # Log action
+        log = ActionLog(
+            user_id=get_jwt_identity(),
+            action="logout",
+            resource="Token",
+            details=json.dumps({"jti": jti}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"message": "Successfully logged out"}, 200
+
+@auth_ns.route('/refresh')
+class RefreshToken(Resource):
+    @jwt_required(refresh=True)
+    def post(self):
+        """Refresh access token"""
+        current_user_id = get_jwt_identity()
+        access_token = create_access_token(identity=current_user_id)
+
+        # Log action
+        log = ActionLog(
+            user_id=current_user_id,
+            action="refresh_token",
+            resource="Token",
+            details=json.dumps({"user_id": current_user_id}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"access_token": access_token}, 200
+
+@auth_ns.route('/me')
+class Me(Resource):
+    @jwt_required()
+    def get(self):
+        """Get current user information"""
+        current_user_id = get_jwt_identity()
+        user = get_user_by_id(current_user_id)
+
+        if user:
+            # Log action
+            log = ActionLog(
+                user_id=current_user_id,
+                action="view_profile",
+                resource="User",
+                resource_id=user.id,
+                details=json.dumps({"username": user.username}),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
+            return {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role,
+                "department": user.department
+            }, 200
+
+        return {"error": "User not found"}, 404
+
+@auth_ns.route('/forgot-password')
+class ForgotPassword(Resource):
+    @auth_ns.expect(forgot_password_model)
+    def post(self):
+        """Send password reset email"""
+        data = request.json
+        email = data.get('email')
+
+        if not email:
+            return {"error": "Email is required"}, 400
+
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return {"error": "User with this email not found"}, 404
+
+        # Generate reset token (JWT with limited expiry)
+        reset_token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
+
+        # Send email with the reset token (implement `send_email`)
+        send_email(
+            to=email,
+            subject="Password Reset",
+            body=f"Use this token to reset your password: {reset_token}"
+        )
+
+        # Log action
+        log = ActionLog(
+            user_id=user.id,
+            action="forgot_password",
+            resource="User",
+            resource_id=user.id,
+            details=json.dumps({"email": email}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"message": "Password reset email sent"}, 200
+
+@auth_ns.route('/reset-password')
+class ResetPassword(Resource):
+    @auth_ns.expect(reset_password_model)
+    def post(self):
+        """Reset user password"""
+        data = request.json
+        reset_token = data.get('reset_token')
+        new_password = data.get('new_password')
+
+        if not reset_token or not new_password:
+            return {"error": "Token and new password are required"}, 400
+
+        try:
+            user_id = decode_token(reset_token)["sub"]
+            user = get_user_by_id(user_id)
+
+            if not user:
+                return {"error": "Invalid or expired token"}, 400
+
+            # Set new password
+            user.set_password(new_password)
+            db.session.commit()
+
+            # Log action
+            log = ActionLog(
+                user_id=user_id,
+                action="reset_password",
+                resource="User",
+                resource_id=user.id,
+                details=json.dumps({"reset_token": reset_token}),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
+            return {"message": "Password reset successfully"}, 200
+
+        except Exception as e:
+            return {"error": str(e)}, 400
+
+@auth_ns.route('/update-username')
+class UpdateUsername(Resource):
+    @auth_ns.expect(update_username_model)
+    @jwt_required()
+    def patch(self):
+        """Update the username of the current user"""
+        data = request.json
+        new_username = data.get('new_username')
+
+        if not new_username:
+            return {"error": "New username is required"}, 400
+
+        current_user_id = get_jwt_identity()
+        user = get_user_by_id(current_user_id)
+
+        if User.query.filter_by(username=new_username).first():
+            return {"error": "Username already taken"}, 400
+
+        old_username = user.username
+        user.username = new_username
+        db.session.commit()
+
+        # Log action
+        log = ActionLog(
+            user_id=current_user_id,
+            action="update_username",
+            resource="User",
+            resource_id=user.id,
+            details=json.dumps({"old_username": old_username, "new_username": new_username}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"message": "Username updated successfully"}, 200
+
+@auth_ns.route('/update-email')
+class UpdateEmail(Resource):
+    @auth_ns.expect(update_email_model)
+    @jwt_required()
+    def patch(self):
+        """Update the email of the current user"""
+        data = request.json
+        new_email = data.get('new_email')
+
+        if not new_email:
+            return {"error": "New email is required"}, 400
+
+        current_user_id = get_jwt_identity()
+        user = get_user_by_id(current_user_id)
+
+        if User.query.filter_by(email=new_email).first():
+            return {"error": "Email already taken"}, 400
+
+        old_email = user.email
+        user.email = new_email
+        db.session.commit()
+
+        # Log action
+        log = ActionLog(
+            user_id=current_user_id,
+            action="update_email",
+            resource="User",
+            resource_id=user.id,
+            details=json.dumps({"old_email": old_email, "new_email": new_email}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"message": "Email updated successfully"}, 200
+
+@auth_ns.route('/change-password')
+class ChangePassword(Resource):
+    @auth_ns.expect(change_password_model)
+    @jwt_required()
+    def post(self):
+        """Change user password"""
+        data = request.json
+        old_password = data.get('old_password')
+        new_password = data.get('new_password')
+
+        if not old_password or not new_password:
+            return {"error": "Old password and new password are required"}, 400
+
+        current_user_id = get_jwt_identity()
+        user = get_user_by_id(current_user_id)
+
+        if not user.check_password(old_password):
+            return {"error": "Incorrect old password"}, 400
+
+        # Update password
+        user.set_password(new_password)
+        db.session.commit()
+
+        # Log action
+        log = ActionLog(
+            user_id=current_user_id,
+            action="change_password",
+            resource="User",
+            resource_id=user.id,
+            details=json.dumps({"action": "password changed"}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return {"message": "Password changed successfully"}, 200
+
 
 # Results routes
 @results_ns.route('/submit')
 class SubmitResults(Resource):
     @results_ns.expect(result_model)
-    @results_ns.response(200, 'Results submitted successfully')
-    @results_ns.response(400, 'Validation error')
-    @results_ns.response(401, 'Unauthorized')
-    @results_ns.doc(security='Bearer')
-    @jwt_required()
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
     def post(self):
         """Submit new results for a course"""
         data = request.json
+
+        # Validate required fields in the main payload
         required_fields = ['course_code', 'course_title', 'course_unit', 'level', 
-                          'faculty', 'exam_department', 'semester_name', 'session', 'results']
-        
+                           'faculty', 'department', 'semester_name', 'session', 'results', 'lecturers']
         error_response = check_required_fields(data, required_fields)
         if error_response:
             return error_response
-        
+
         lecturer_id = get_jwt_identity()
-        course = get_or_create_course(data)
 
-        if data.get('lecturers'):
-            lecturers = User.query.filter(User.id.in_(data['lecturers'])).all()
-            if lecturers:
-                course.lecturers = lecturers
+        # Fetch or create the course
+        course = get_or_create_course({
+            "code": data['course_code'],
+            "title": data['course_title'],
+            "unit": data['course_unit'],
+            "department": data['department'],
+            "faculty": data['faculty'],
+            "level": data['level']
+        })
 
+        # Fetch or create the semester
         semester = get_or_create_semester(data['session'], data['semester_name'])
 
-        for result_data in data['results']:
-            error = process_result(result_data, course, semester, lecturer_id)
-            if error:
-                return error
-        
-        db.session.commit()
-        return {"message": "Results submitted successfully"}, 200
+        # Check if a result for this course and semester already exists
+        result = Result.query.filter_by(
+            course_id=course.id,
+            semester_id=semester.id
+        ).first()
 
-@results_ns.route('/by-course')
-class ResultsByCourse(Resource):
+        if not result:
+            # Create a new result
+            result = Result(
+                course_id=course.id,
+                semester_id=semester.id,
+                uploader_lecturer_id=lecturer_id,
+                upload_date=datetime.utcnow()
+            )
+            db.session.add(result)
+            db.session.flush()  # Get `result.id` for linking scores
+
+        try:
+            # Process each score
+            for result_data in data['results']:
+                # Validate required fields in each result
+                required_result_fields = ['registration_number', 'ca_score', 'exam_score', 'total_score', 'grade']
+                error_response = check_required_fields(result_data, required_result_fields)
+                if error_response:
+                    return error_response
+
+                # Fetch or create the student
+                student = get_student_by_registration(result_data['registration_number'])
+                if not student:
+                    student = Student(
+                        registration_number=result_data['registration_number'],
+                        name=result_data['student_name'],
+                        department=data['department']
+                    )
+                    db.session.add(student)
+                    db.session.flush()  # Ensure `student.id` is available
+
+                # Save the score linked to the result
+                score = Score(
+                    result_id=result.id,  # Link the score to the shared result
+                    student_id=student.id,
+                    continuous_assessment=result_data['ca_score'],
+                    exam_score=result_data['exam_score'],
+                    total_score=result_data['total_score'],
+                    grade=result_data['grade']
+                )
+                db.session.add(score)
+
+            # Commit all changes
+            db.session.commit()
+            # # Log action
+            # log = ActionLog(
+            #     user_id=user.id,
+            #     action="submit_result",
+            #     resource="Result",
+            #     resource_id=result.id,
+            #     details=json.dumps({"username": user.username}),
+            #     ip_address=request.remote_addr,
+            #     user_agent=request.headers.get('User-Agent')
+            # )
+            # db.session.add(log)
+            # db.session.commit()
+            return {"message": "Results submitted successfully"}, 200
+        except Exception as e:
+            db.session.rollback()
+            return {"error": str(e)}, 500
+
+@results_ns.route('/list')
+class ResultListView(Resource):
     @results_ns.doc(params={
-        'course_code': 'Course code',
-        'semester_name': 'Semester name',
-        'session': 'Academic session'
+        'department': 'Filter by department (optional)',
+        'course_code': 'Filter by course code (optional)',
+        'semester': 'Filter by semester (optional)',
+        'session': 'Filter by academic session (optional)',
+        'page': 'Page number for pagination (optional, default=1)',
+        'per_page': 'Number of results per page (optional, default=10)'
     })
-    # @results_ns.expect(api.model('DepartmentRequest', {
-    #     'course_code': fields.String(required=True),
-    #     'semester_name': fields.String(required=False),
-    #     'session': fields.String(required=False)
-    # }))
-    @results_ns.response(200, 'Results retrieved successfully')
-    @results_ns.response(404, 'Course not found')
+    @results_ns.response(200, 'Results list retrieved successfully')
     @results_ns.doc(security='Bearer')
-    @jwt_required()
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
     def get(self):
-        """Get results for a specific course"""
-        current_user_id = get_jwt_identity()
-        current_user = User.query.get(current_user_id)
-        
+        """Get a list of all result metadata with optional filters"""
+        # Retrieve filters from query parameters
+        department = request.args.get('department')
         course_code = request.args.get('course_code')
-        semester_name = request.args.get('semester_name')
+        semester = request.args.get('semester')
         session = request.args.get('session')
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
 
-        if not course_code or not session or not semester_name:
-            return {"error": "Missing required course or session details"}, 400
+        # Initialize query
+        query = Result.query
 
+        # Apply filters
+        if department:
+            query = query.join(Course).filter(Course.department.ilike(f"%{department}%"))
+        if course_code:
+            query = query.join(Course).filter(Course.code.ilike(f"%{course_code}%"))
         course = Course.query.filter_by(code=course_code).first()
         if not course:
             return {"error": "Course not found"}, 404
-
         if current_user.role == 'lecturer' and current_user not in course.lecturers:
             return {"error": "You are not authorized to access results for this course"}, 403
+        if semester:
+            query = query.join(Semester).filter(Semester.name.ilike(f"%{semester}%"))
+        if session:
+            query = query.join(Semester).filter(Semester.name.ilike(f"%{session}%"))
 
-        semester = Semester.query.filter_by(name=f"{session} {semester_name}").first()
-        if not semester:
-            return {"error": "Semester not found"}, 404
+        # Fetch paginated results
+        results = query.paginate(page=page, per_page=per_page, error_out=False)
 
-        results = Result.query.filter_by(course_id=course.id, semester_id=semester.id).all()
-        if not results:
-            return {"error": f"No results found for course {course_code}"}, 404
-
-        results_data = []
-        for result in results:
-            results_data.append({
-                "student_name": result.student.name,
-                "registration_number": result.student.registration_number,
-                "student_department": result.student.department,
-                "ca_score": result.continuous_assessment,
-                "exam_score": result.exam_score,
-                "total_score": result.total_score,
-                "grade": result.grade
+        # Prepare metadata for each result
+        result_list = []
+        for result in results.items:
+            result_list.append({
+                "id": result.id,
+                "course_code": result.course.code,
+                "course_title": result.course.title,
+                "semester": result.semester.name,
+                "uploaded_by": result.uploader.username,
+                "upload_date": result.upload_date.isoformat() if result.upload_date else None,
+                "department": result.course.department,
+                "faculty": result.course.faculty,
+                "num_scores": len(result.scores)
             })
 
         return {
-            "course_code": course.code,
-            "course_title": course.title,
-            "course_department": course.department,
-            "course_unit": course.unit,
-            "faculty": course.faculty,
-            "semester": semester_name,
-            "session": session,
-            "results": results_data
+            "results": result_list,
+            "total_results": results.total,
+            "current_page": results.page,
+            "total_pages": results.pages,
+            "per_page": results.per_page
+        }, 200
+
+@results_ns.route('/<int:result_id>')
+class ResultDetailView(Resource):
+    @results_ns.response(200, 'Result details retrieved successfully')
+    @results_ns.response(404, 'Result not found')
+    @results_ns.doc(security='Bearer')
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
+    def get(self, result_id):
+        """Get detailed information for a specific result"""
+        result = Result.query.get(result_id)
+        if not result:
+            return {"error": "Result not found"}, 404
+
+        # Fetch the associated scores for the result
+        scores = Score.query.filter_by(result_id=result.id).all()
+
+        # Prepare the response
+        return {
+            "id": result.id,
+            "course_code": result.course.code,
+            "course_title": result.course.title,
+            "semester": result.semester.name,
+            "uploaded_by": result.uploader.username,
+            "upload_date": result.upload_date.isoformat() if result.upload_date else None,  # Serialize datetime
+            "department": result.course.department,
+            "faculty": result.course.faculty,
+            "scores": [
+                {
+                    "student_name": score.student.name,
+                    "registration_number": score.student.registration_number,
+                    "continuous_assessment": score.continuous_assessment,
+                    "exam_score": score.exam_score,
+                    "total_score": score.total_score,
+                    "grade": score.grade
+                } for score in scores
+            ]
         }, 200
 
 @results_ns.route('/by-registration')
 class ResultsByRegistration(Resource):
     @results_ns.doc(params={
-        'registration_number': 'Student registration number',
+        'registration_number': 'Student registration number (required)',
         'session': 'Academic session (optional)'
     })
     @results_ns.response(200, 'Results retrieved successfully')
     @results_ns.response(404, 'Student not found')
+    @results_ns.response(400, 'Missing required parameters')
     @results_ns.doc(security='Bearer')
     @jwt_role_required('hod', 'exam_officer')
     def get(self):
-        """Get results for a specific student"""
+        """Get results for a specific student by their registration number"""
+        # Get query parameters
         registration_number = request.args.get('registration_number')
         session = request.args.get('session')
 
+        # Validate the registration number
         if not registration_number:
             return {"error": "Missing required query parameter: registration_number"}, 400
 
+        # Fetch the student
         student = get_student_by_registration(registration_number)
         if not student:
-            return {"error": "Student not found"}, 404
+            return {"error": f"Student with registration number '{registration_number}' not found."}, 404
+
+        # Query scores and join with related models
+        query = Score.query.options(
+            joinedload(Score.result).joinedload(Result.course),
+            joinedload(Score.result).joinedload(Result.semester)
+        ).filter(Score.student_id == student.id)
 
         if session:
-            results = Result.query.join(Semester).filter(
-                Result.student_id == student.id,
-                Semester.name.like(f'{session}%')
-            ).all()
-        else:
-            results = Result.query.filter_by(student_id=student.id).join(Semester).all()
+            query = query.join(Result.semester).filter(Semester.name.like(f'{session}%'))
 
-        if not results:
-            return {"error": f"No results found for student {registration_number}"}, 404
+        scores = query.all()
 
-        grouped_results, total_credit_earned, total_grade_point = process_results_data(results)
+        # Handle case where no results are found
+        if not scores:
+            return {"error": f"No results found for student '{registration_number}'."}, 404
+
+        # Process scores data grouped by session and semester
+        grouped_results, total_credit_earned, total_grade_point = process_scores_data(scores)
 
         session_results = []
         for session_name, session_data in grouped_results.items():
@@ -293,8 +758,29 @@ class ResultsByRegistration(Resource):
                 "results_by_semester": session_data["results_by_semester"]
             })
 
+        # Calculate CGPA
         cgpa = round(total_grade_point / total_credit_earned, 2) if total_credit_earned > 0 else 0
 
+        # Log the action
+        current_user_id = get_jwt_identity()
+        log = ActionLog(
+            user_id=current_user_id,
+            action="view_results_by_registration",
+            resource="Score",
+            resource_id=None,
+            details=json.dumps({
+                "registration_number": registration_number,
+                "session": session,
+                "results_count": len(scores),
+                "cgpa": cgpa
+            }),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        # Prepare response data
         return {
             "student_name": student.name,
             "registration_number": student.registration_number,
@@ -305,167 +791,298 @@ class ResultsByRegistration(Resource):
             "results": session_results
         }, 200
 
-@results_ns.route('/update')
-class UpdateResult(Resource):
-    @results_ns.doc(params={
-        'course_code': 'Course code',
-        'registration_number': 'Student registration number',
-        'session': 'Academic session',
-        'semester': 'Semester name'
-    })
-    @results_ns.response(200, 'Result updated successfully')
-    @results_ns.response(404, 'Result not found')
-    @results_ns.doc(security='Bearer')
-    @jwt_required()
-    def put(self):
-        """Update an existing result"""
-        current_user_id = get_jwt_identity()
-        current_user = User.query.get(current_user_id)
-
-        if current_user.role not in ['hod', 'exam_officer', 'lecturer']:
-            return {"error": "You are not authorized to update results"}, 403
-
+@results_ns.route('/<int:result_id>/update-score')
+class UpdateOrCreateScore(Resource):
+    @results_ns.expect(score_update_model)
+    @results_ns.response(200, 'Score updated or created successfully')
+    @results_ns.response(404, 'Result or student not found')
+    @results_ns.response(400, 'Invalid request payload')
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
+    def patch(self, result_id):
+        """Update or create a score for a result, including adding a new student"""
         data = request.json
-        course_code = data.get('course_code')
-        registration_number = data.get('registration_number')
-        session = data.get('session')
-        semester_name = data.get('semester')
 
-        if not all([course_code, registration_number, session, semester_name]):
-            return {"error": "Missing required fields"}, 400
+        # Validate required parameters
+        registration_number = data.get("registration_number")
+        if not registration_number:
+            return {"error": "Registration number is required"}, 400
 
-        course = Course.query.filter_by(code=course_code).first()
-        if not course:
-            return {"error": "Course not found"}, 404
-
-        student = get_student_by_registration(registration_number)
-        if not student:
-            return {"error": "Student not found"}, 404
-
-        semester = Semester.query.filter_by(name=f"{session} {semester_name}").first()
-        if not semester:
-            return {"error": "Semester not found"}, 404
-
-        result = Result.query.filter_by(
-            student_id=student.id,
-            course_id=course.id,
-            semester_id=semester.id
-        ).first()
-
+        # Validate if the result exists
+        result = Result.query.get(result_id)
         if not result:
-            return {"error": "Result not found"}, 404
+            return {"error": f"Result with ID {result_id} not found"}, 404
 
-        if current_user.role == 'lecturer' and result.lecturer_id != current_user.id:
-            return {"error": "You are not authorized to update this result"}, 403
+        # Fetch or create the student
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            # If the student doesn't exist, create a new student
+            if not data.get("student_name"):
+                return {"error": "Student name is required for new students"}, 400
+            student = Student(
+                registration_number=registration_number,
+                name=data["student_name"],
+                department=result.course.department  # Use the department linked to the course
+            )
+            db.session.add(student)
+            db.session.flush()  # Get the `student.id` before proceeding
 
-        for field in ['ca_score', 'exam_score', 'total_score', 'grade']:
-            if data.get(field) is not None:
-                setattr(result, field, data[field])
+        # Fetch or create the score
+        score = Score.query.filter_by(result_id=result.id, student_id=student.id).first()
+        if not score:
+            # Create a new score if it doesn't exist
+            score = Score(
+                result_id=result.id,
+                student_id=student.id
+            )
+            db.session.add(score)
 
-        db.session.commit()
-        return {"message": "Result updated successfully"}, 200
+        try:
+            # Update fields if provided in the payload
+            if "ca_score" in data:
+                score.continuous_assessment = data["ca_score"]
+            if "exam_score" in data:
+                score.exam_score = data["exam_score"]
+            if "total_score" in data:
+                score.total_score = data["total_score"]
+            else:
+                # Calculate total_score automatically if ca_score or exam_score is updated
+                score.total_score = score.continuous_assessment + score.exam_score
+
+            if "grade" in data:
+                score.grade = data["grade"]
+
+            # Commit changes
+            db.session.commit()
+
+            # Log the action
+            current_user_id = get_jwt_identity()
+            log = ActionLog(
+                user_id=current_user_id,
+                action="update_or_create_score",
+                resource="Score",
+                resource_id=score.id,
+                details=json.dumps(data),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
+            return {"message": "Score updated or created successfully"}, 200
+
+        except Exception as e:
+            db.session.rollback()
+            return {"error": f"An error occurred: {str(e)}"}, 500
+
+@results_ns.route('/<int:result_id>/update-meta')
+class UpdateResultMeta(Resource):
+    @results_ns.expect(result_update_model)
+    @results_ns.response(200, 'Result metadata updated successfully')
+    @results_ns.response(404, 'Result not found')
+    @results_ns.response(400, 'Invalid request payload')
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
+    def patch(self, result_id):
+        """Update metadata for a specific result"""
+        data = request.json
+
+        # Fetch the result by ID
+        result = Result.query.get(result_id)
+        if not result:
+            return {"error": f"Result with ID {result_id} not found."}, 404
+
+        # Dynamically set the uploader_lecturer_id from the current user (using JWT)
+        uploader_lecturer_id = get_jwt_identity()
+
+        # Update fields dynamically if present in the payload
+        try:
+            # Check and update course code if provided
+            if "course_code" in data:
+                course = Course.query.filter_by(code=data["course_code"]).first()
+                if not course:
+                    return {"error": f"Course with code '{data['course_code']}' not found."}, 404
+                result.course_id = course.id
+
+            # Check and update semester and session if provided
+            if "semester_name" in data and "session" in data:
+                semester_name = f"{data['session']} {data['semester_name']}"
+                semester = Semester.query.filter_by(name=semester_name).first()
+                if not semester:
+                    return {"error": f"Semester '{semester_name}' not found."}, 404
+                result.semester_id = semester.id
+
+            # Update course title and unit if provided
+            if "course_title" in data:
+                result.course.title = data["course_title"]
+            if "course_unit" in data:
+                result.course.unit = data["course_unit"]
+
+            # Update department if provided
+            if "department" in data:
+                result.course.department = data["department"]
+
+            # If uploader_lecturer_id is provided, update it
+            result.uploader_lecturer_id = uploader_lecturer_id
+
+            # Optionally update the original file if provided
+            if "original_file" in data:
+                result.original_file = data["original_file"]
+
+            # Commit the updates
+            db.session.commit()
+
+            # Log the action
+            log = ActionLog(
+                user_id=uploader_lecturer_id,
+                action="update_result_meta",
+                resource="Result",
+                resource_id=result_id,
+                details=json.dumps(data),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
+            return {"message": "Result metadata updated successfully"}, 200
+
+        except Exception as e:
+            db.session.rollback()
+            return {"error": f"An error occurred: {str(e)}"}, 500
+
+@results_ns.route('/search')
+class SearchResults(Resource):
+    @results_ns.doc(params={
+        'course_code': 'Course code to filter results',
+        'department': 'Department to filter results',
+        'faculty': 'Faculty to filter results',
+        'semester_name': 'Semester name to filter results',
+        'session': 'Session to filter results',
+        'registration_number': 'Student registration number to filter results',
+        'page': 'Page number for pagination',
+        'per_page': 'Number of results per page'
+    })
+    @results_ns.response(200, 'Search results retrieved successfully')
+    @results_ns.response(400, 'Invalid request parameters')
+    @results_ns.doc(security='Bearer')
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
+    def get(self):
+        """Search results based on multiple criteria"""
+        # Query parameters
+        course_code = request.args.get('course_code')
+        department = request.args.get('department')
+        faculty = request.args.get('faculty')
+        semester_name = request.args.get('semester_name')
+        session = request.args.get('session')
+        registration_number = request.args.get('registration_number')
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+
+        # Initialize query
+        query = Result.query.join(Course).join(Semester).join(Score)
+
+        # Apply filters
+        if course_code:
+            query = query.filter(Course.code.ilike(f"%{course_code}%"))
+        if department:
+            query = query.filter(Course.department.ilike(f"%{department}%"))
+        if faculty:
+            query = query.filter(Course.faculty.ilike(f"%{faculty}%"))
+        if semester_name:
+            query = query.filter(Semester.name.ilike(f"%{semester_name}%"))
+        if session:
+            query = query.filter(Semester.name.like(f"{session} %"))
+        if registration_number:
+            query = query.join(Score).filter(Score.student_id == Student.query.filter_by(
+                registration_number=registration_number).with_entities(Student.id))
+
+        # Paginate results
+        results = query.paginate(page=page, per_page=per_page, error_out=False)
+
+        # Prepare response data
+        search_results = []
+        for result in results.items:
+            search_results.append({
+                "id": result.id,
+                "course_code": result.course.code,
+                "course_title": result.course.title,
+                "semester": result.semester.name,
+                "department": result.course.department,
+                "faculty": result.course.faculty,
+                "upload_date": result.upload_date.isoformat() if result.upload_date else None,
+                "num_scores": len(result.scores)
+            })
+
+        # Return paginated results
+        return {
+            "search_results": search_results,
+            "total_results": results.total,
+            "current_page": results.page,
+            "total_pages": results.pages,
+            "per_page": results.per_page
+        }, 200
 
 @results_ns.route('/delete/<int:result_id>')
 class DeleteResult(Resource):
     @results_ns.response(200, 'Result deleted successfully')
     @results_ns.response(404, 'Result not found')
     @results_ns.doc(security='Bearer')
-    @jwt_required()
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
     def delete(self, result_id):
-        """Delete a result"""
-        current_user_id = get_jwt_identity()
-        current_user = User.query.get(current_user_id)
-        
-        result = Result.query.get(result_id)
+        """Delete a result and its associated scores"""
+        # Fetch the result and pre-load relationships
+        result = Result.query.options(
+            joinedload(Result.course),
+            joinedload(Result.semester)
+        ).filter_by(id=result_id).first()
+
         if not result:
             return {"error": "Result not found"}, 404
-        
-        if current_user.role in ['hod', 'exam_officer'] or (
-            current_user.role == 'lecturer' and result.lecturer_id == current_user.id
-        ):
+
+        try:
+            # Fetch all associated scores
+            scores = Score.query.filter_by(result_id=result.id).all()
+
+            # Store relevant details for logging
+            course_code = result.course.code if result.course else None
+            course_title = result.course.title if result.course else None
+            semester_name = result.semester.name if result.semester else None
+
+            # Delete all associated scores
+            for score in scores:
+                db.session.delete(score)
+
+            # Delete the result
             db.session.delete(result)
             db.session.commit()
-            return {"message": "Result deleted successfully"}, 200
-        else:
-            return {"error": "You are not authorized to delete this result"}, 403
 
-@results_ns.route('/by-department')
-class ResultsByDepartment(Resource):
-    # @results_ns.doc(params={
-    #     'department': 'Department name',
-    #     'session': 'Academic session',
-    #     'semester': 'Semester name (optional)'
-    # },
-    #     security='Bearer'
-    # )
-    @results_ns.expect(api.model('DepartmentRequest', {
-        'department': fields.String(required=True),
-        'session': fields.String(required=False),
-        'semester': fields.String(required=False)
-    }))
-    @results_ns.response(200, 'Results retrieved successfully')
-    @results_ns.response(404, 'Department not found')
-    @results_ns.doc(security='Bearer')
-    @jwt_role_required('hod', 'exam_officer')
-    def post(self):
-        """Get results for a specific department"""
-        data = request.json
-        session = data.get('session')
-        semester_name = data.get('semester')
-        department = data.get('department').upper()
+            # Log the action
+            current_user_id = get_jwt_identity()
+            log = ActionLog(
+                user_id=current_user_id,
+                action="delete_result",
+                resource="Result",
+                resource_id=result_id,
+                details=json.dumps({
+                    "course_code": course_code,
+                    "course_title": course_title,
+                    "semester": semester_name,
+                    "deleted_scores_count": len(scores)
+                }),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
 
-        if not session or not department:
-            return {"error": "Missing required details"}, 400
+            return {
+                "message": "Result and its associated scores deleted successfully",
+                "deleted_scores_count": len(scores)
+            }, 200
 
-        course = Course.query.filter_by(department=department).first()
-        if not course:
-            return {"error": "No courses found for department"}, 404
-
-        semester_full_name = f"{session} {semester_name}" if semester_name else None
-
-        if semester_name:
-            semester = Semester.query.filter_by(name=semester_full_name).first()
-            if not semester:
-                return {"error": "Semester not found"}, 404
-
-            results = Result.query.join(Course).join(Semester).filter(
-                Semester.name.like(f"{session} {semester_name}"),
-                Course.department == department     
-            ).all()
-        else:
-            results = Result.query.join(Course).filter(
-                Course.department == department
-            ).all()
-
-        if not results:
-            return {"error": f"No results found for {department}"}, 404
-
-        results_data = []
-        for result in results:
-            results_data.append({
-                "student_name": result.student.name,
-                "registration_number": result.student.registration_number,
-                "courses": {
-                    "code": result.course.code,
-                    "title": result.course.title,
-                    "unit": result.course.unit,
-                    "department": result.course.department,
-                    "faculty": result.course.faculty,
-                    "results": {
-                        "ca_score": result.continuous_assessment,
-                        "exam_score": result.exam_score,
-                        "total_score": result.total_score,
-                        "grade": result.grade
-                    }
-                }
-            })
-
-        return {
-            "department": department,
-            "semester": semester_full_name if semester_name else "All Semesters",
-            "session": session,
-            "results": results_data
-        }, 200
+        except Exception as e:
+            # Rollback in case of any error
+            db.session.rollback()
+            return {"error": f"An error occurred while deleting the result: {str(e)}"}, 500
 
 # File Upload Route
 upload_parser = api.parser()
@@ -478,8 +1095,9 @@ class UploadResults(Resource):
 
     @results_ns.expect(upload_parser)
     @results_ns.doc(security='Bearer')
-    @jwt_required()
+    @jwt_role_required('hod', 'exam_officer', 'lecturer')
     def post(self):
+        """Upload and process a results file"""
         if 'file' not in request.files:
             return {"error": "No file part"}, 400
 
@@ -494,23 +1112,26 @@ class UploadResults(Resource):
                 return {"error": message}, 400
 
             header_info, results_data = extraction_result
-            
+            uploader_id = get_jwt_identity()
+
             file_info = {
                 'filename': file.filename,
-                'uploader_id': get_jwt_identity()
+                'uploader_id': uploader_id
             }
 
+            # Save extracted data to the database
             success, db_message = save_results_to_db(header_info, results_data, file_info)
             if not success:
                 return {"error": db_message}, 500
 
             return {
-                "message": "File processed successfully",
+                "message": "File processed and results saved successfully",
                 "records": len(results_data)
             }, 200
 
         except Exception as e:
             return {"error": str(e)}, 500
+
 
 # Protected Route Example
 @auth_ns.route('/protected')
