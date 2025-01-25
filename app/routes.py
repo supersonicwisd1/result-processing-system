@@ -1,10 +1,10 @@
 # flask-app/app/routes.py
 import os
-from flask import Blueprint, request, jsonify, session
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt, decode_token
+from flask import Blueprint, request, jsonify, session, abort
+from flask_jwt_extended import create_access_token, jwt_required as original_jwt_required, get_jwt_identity, get_jwt, decode_token, verify_jwt_in_request
 from .utils import (create_error_response, get_user_by_id, get_user_by_username, get_user_by_email,
                     get_student_by_registration, check_required_fields,
-                    get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db, send_reset_email,
+                    get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db, send_otp_email,
                     process_uploaded_file, process_scores_data)
 from .models import User, db, Result, Student, Course, Semester, ActionLog, TokenBlacklist, Score
 from .constants import ALLOWED_ROLES, UPLOAD_FOLDER
@@ -13,6 +13,8 @@ from flask_restx import Api, Resource, fields, Namespace
 import json
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
+import random
+import string
 
 import logging
 
@@ -66,7 +68,8 @@ forgot_password_model = api.model('ForgotPassword', {
 })
 
 reset_password_model = api.model('ResetPassword', {
-    'reset_token': fields.String(required=True, description='Token sent for password reset'),
+    'email': fields.String(required=True, description='The email associated with the user account'),
+    'otp': fields.String(required=True, description='Code sent for password reset'),
     'new_password': fields.String(required=True, description='The new password to set')
 })
 
@@ -122,28 +125,49 @@ result_model = api.model('Result', {
     'results': fields.List(fields.Nested(student_result_model), required=True, description='List of student results')
 })
 
-# Authorization decorator
-def role_required(*roles):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            current_user_id = get_jwt_identity()
-            current_user = get_user_by_id(current_user_id)
-            if current_user.role not in roles:
-                return {"error": "You are not authorized to access this resource"}, 403
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+# Custom JWT required decorator  
+# Custom JWT required decorator  
+def jwt_required(*args, **kwargs):  
+    def wrapper(fn):  
+        @wraps(fn)  
+        def decorated(*args, **kwargs):  
+            # First, verify the JWT in the request  
+            try:  
+                verify_jwt_in_request(*args, **kwargs)  # This will raise an error if the token is invalid or missing  
+            except Exception as e:  
+                abort(401, description=str(e))  # Handle the exception and return unauthorized  
 
-# JWT role decorator
-def jwt_role_required(*roles):
-    def wrapper(fn):
-        @wraps(fn)
-        @jwt_required()
-        @role_required(*roles)
-        def decorated(*args, **kwargs):
-            return fn(*args, **kwargs)
-        return decorated
+            # Now that the token is verified, check if it's blacklisted  
+            jti = get_jwt()["jti"]  
+            if TokenBlacklist.query.filter_by(jti=jti).scalar() is not None:  
+                abort(401, description="Token has been revoked")  # Unauthorized  
+
+            return fn(*args, **kwargs)  # Call the original function  
+        return decorated  
+    return wrapper  
+
+# Authorization decorator  
+def role_required(*roles):  
+    def decorator(f):  
+        @wraps(f)  
+        def decorated_function(*args, **kwargs):  
+            current_user_id = get_jwt_identity()  
+            current_user = User.query.get(current_user_id)  # Adjust based on your User model  
+            if current_user is None or current_user.role not in roles:  
+                return {"error": "You are not authorized to access this resource"}, 403  
+            return f(*args, **kwargs)  
+        return decorated_function  
+    return decorator  
+
+# JWT role decorator  
+def jwt_role_required(*roles):  
+    def wrapper(fn):  
+        @wraps(fn)  
+        @jwt_required()  # Use the updated jwt_required  
+        @role_required(*roles)  
+        def decorated(*args, **kwargs):  
+            return fn(*args, **kwargs)  
+        return decorated  
     return wrapper
 
 # Authentication routes
@@ -227,35 +251,37 @@ class Login(Resource):
 
         return {"error": "Invalid credentials"}, 401
 
-@auth_ns.route('/logout')
-class Logout(Resource):
-    @jwt_required()
-    def post(self):
-        """Logout the user by blacklisting their token"""
-        jti = get_jwt()["jti"]  # JWT ID
-        token_type = get_jwt()["type"]  # Access or Refresh
+@auth_ns.route('/logout')  
+class Logout(Resource):  
+    @jwt_required()  
+    def post(self):  
+        jti = get_jwt()["jti"]  # JWT ID  
+        token_type = get_jwt()["type"]  # Access or Refresh  
 
-        # Add the token to the blacklist
-        token = TokenBlacklist(jti=jti, token_type=token_type)
-        db.session.add(token)
+        token = TokenBlacklist(jti=jti, token_type=token_type)  
 
-        # Log action
-        log = ActionLog(
-            user_id=get_jwt_identity(),
-            action="logout",
-            resource="Token",
-            details=json.dumps({"jti": jti}),
-            ip_address=request.remote_addr,
-            user_agent=request.headers.get('User-Agent')
-        )
-        db.session.add(log)
-        db.session.commit()
+        # Log the action  
+        log = ActionLog(  
+            user_id=get_jwt_identity(),  
+            action="logout",  
+            resource="Token",  
+            details=json.dumps({"jti": jti}),  
+            ip_address=request.remote_addr,  
+            user_agent=request.headers.get('User-Agent')  
+        )  
 
-        return {"message": "Successfully logged out"}, 200
+        try:  
+            db.session.add(token)  
+            db.session.add(log)  
+            db.session.commit()  
+            return {"message": "Successfully logged out"}, 200  
+        except Exception as e:  
+            db.session.rollback()  # Rollback the session  
+            return {"message": "Token already logged out"}, 400
 
 @auth_ns.route('/refresh')
 class RefreshToken(Resource):
-    @jwt_required(refresh=True)
+    @original_jwt_required(refresh=True)
     def post(self):
         """Refresh access token"""
         current_user_id = get_jwt_identity()
@@ -307,84 +333,92 @@ class Me(Resource):
 
         return {"error": "User not found"}, 404
 
-@auth_ns.route('/forgot-password')
-class ForgotPassword(Resource):
-    @auth_ns.expect(forgot_password_model)
-    def post(self):
-        """Send password reset email"""
-        data = request.json
-        email = data.get('email')
+@auth_ns.route('/forgot-password')  
+class ForgotPassword(Resource):  
+    @auth_ns.expect(forgot_password_model)  
+    def post(self):  
+        """Send OTP for password reset"""  
+        data = request.json  
+        email = data.get('email')  
 
-        if not email:
-            return {"error": "Email is required"}, 400
+        if not email:  
+            return {"error": "Email is required"}, 400  
 
-        user = User.query.filter_by(email=email).first()
-        if not user:
-            return {"error": "User with this email not found"}, 404
+        user = User.query.filter_by(email=email).first()  
+        if not user:  
+            return {"error": "User with this email not found"}, 404  
 
-        # Generate reset token (JWT with limited expiry)
-        reset_token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
+        # Generate a temporary OTP  
+        otp = ''.join(random.choices(string.digits, k=6))  # Generate a 6-digit OTP  
+        expiry_time = datetime.utcnow() + timedelta(minutes=30)  # Set OTP expiry to 5 minutes  
 
-        # Send email with the reset token
-        send_reset_email(email, reset_token)
+        # Store the OTP and its expiry in the database (you may need to create a new model for this)  
+        user.otp = otp  
+        user.otp_expiry = expiry_time  
+        db.session.commit()  
 
-        # Log action
-        log = ActionLog(
-            user_id=user.id,
-            action="forgot_password",
-            resource="User",
-            resource_id=user.id,
-            details=json.dumps({"email": email}),
-            ip_address=request.remote_addr,
-            user_agent=request.headers.get('User-Agent')
-        )
-        db.session.add(log)
-        db.session.commit()
+        # Send email with the OTP  
+        send_otp_email(email, otp)  
 
-        return {"message": "Password reset email sent"}, 200
+        # Log action  
+        log = ActionLog(  
+            user_id=user.id,  
+            action="forgot_password",  
+            resource="User",  
+            resource_id=user.id,  
+            details=json.dumps({"email": email}),  
+            ip_address=request.remote_addr,  
+            user_agent=request.headers.get('User-Agent')  
+        )  
+        db.session.add(log)  
+        db.session.commit()  
 
+        return {"message": "OTP sent to your email"}, 200 
 
-@auth_ns.route('/reset-password')
-class ResetPassword(Resource):
-    @auth_ns.expect(reset_password_model)
-    def post(self):
-        """Reset user password"""
-        # Extract the token and new password from the payload
-        data = request.json
-        reset_token = data.get('reset_token')
-        new_password = data.get('new_password')
+@auth_ns.route('/reset-password')  
+class ResetPassword(Resource):  
+    @auth_ns.expect(reset_password_model)  # Ensure this model includes 'email', 'otp', and 'new_password'  
+    def post(self):  
+        """Reset user password using OTP code"""  
+        # Extract the email, OTP, and new password from the payload  
+        data = request.json  
+        email = data.get('email')  
+        otp = data.get('otp')  
+        new_password = data.get('new_password')  
 
-        if not reset_token or not new_password:
-            return {"error": "Token and new password are required"}, 400
+        if not email or not otp or not new_password:  
+            return {"error": "Email, OTP, and new password are required"}, 400  
 
-        try:
-            # Decode the token to get the user ID
-            user_id = decode_token(reset_token)["sub"]
-            user = get_user_by_id(user_id)
+        try:  
+            # Retrieve the user based on the provided email  
+            user = User.query.filter_by(email=email).first()  
 
-            if not user:
-                return {"error": "Invalid or expired token"}, 400
+            # Check if user exists and validate OTP  
+            if not user or user.otp != otp or user.otp_expiry < datetime.utcnow():  
+                return {"error": "Invalid or expired OTP"}, 400  
 
-            # Set new password
-            user.set_password(new_password)
-            db.session.commit()
+            # Set new password (ensure you hash it appropriately)  
+            user.set_password(new_password)  
+            user.otp = None  # Clear OTP after use  
+            user.otp_expiry = None  # Clear expiry after use  
+            db.session.commit()  
 
-            # Log the action
-            log = ActionLog(
-                user_id=user_id,
-                action="reset_password",
-                resource="User",
-                resource_id=user.id,
-                details=json.dumps({"reset_token": reset_token}),
-                ip_address=request.remote_addr,
-                user_agent=request.headers.get('User-Agent')
-            )
-            db.session.add(log)
-            db.session.commit()
+            # Log the action  
+            log = ActionLog(  
+                user_id=user.id,  
+                action="reset_password",  
+                resource="User",  
+                resource_id=user.id,  
+                details=json.dumps({"email": email}),  # Log details for tracking  
+                ip_address=request.remote_addr,  
+                user_agent=request.headers.get('User-Agent')  
+            )  
+            db.session.add(log)  
+            db.session.commit()  
 
-            return {"message": "Password reset successfully"}, 200
+            return {"message": "Password reset successfully"}, 200  
 
-        except Exception as e:
+        except Exception as e:  
             return {"error": str(e)}, 400
 
 @auth_ns.route('/update-username')

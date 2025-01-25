@@ -289,11 +289,10 @@ def process_scores_data(scores):
 
     return grouped_scores, overall_total_credit_earned, overall_total_grade_point
 
-def send_reset_email(to_email, reset_token):
+def send_otp_email(to_email, otp):
     try:
-        reset_url = f"http://localhost:5000/api/v1/auth/reset-password?token={reset_token}"
         msg = Message('Password Reset Request', recipients=[to_email])
-        msg.body = f'Use this reset token to reset your password: {reset_token}'
+        msg.body = f'Use this OTP to reset your password: {otp}'
         # msg.html = f'<p>Click the link below to reset your password:</p><p><a href="{reset_url}">Reset Password</a></p>'
         msg.sender = "supersonicwisdom@gmail.com"
         mail.send(msg)

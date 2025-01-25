@@ -15,6 +15,9 @@ class User(db.Model):
     department = db.Column(db.String(100), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    otp = db.Column(db.String(6), nullable=True)  # Store OTP  
+    otp_expiry = db.Column(db.DateTime, nullable=True)  # Store expiry time for OTP
+
     def set_password(self, password):
         self.password = generate_password_hash(password)
 

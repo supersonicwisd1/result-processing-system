@@ -10,6 +10,7 @@ from flask_limiter.util import get_remote_address
 from datetime import timedelta
 from flask_mail import Mail, Message
 from flask_cors import CORS
+from flask_migrate import Migrate  
 
 db = SQLAlchemy()
 
@@ -17,6 +18,8 @@ mail = Mail()
 
 def create_app():
     app = Flask(__name__)
+
+    migrate = Migrate(app, db)
 
     CORS(app)
     limiter = Limiter(get_remote_address, app=app, storage_uri="redis://localhost:6379",
@@ -46,12 +49,12 @@ def create_app():
     app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ["access", "refresh"]
 
     # Set up Flask-Mail configuration
-    app.config['MAIL_SERVER'] = 'smtp.gmail.com'  # SMTP server address (use your email service provider's SMTP)
-    app.config['MAIL_PORT'] = 587  # SMTP port
+    app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER')  # SMTP server address (use your email service provider's SMTP)
+    app.config['MAIL_PORT'] = int(os.getenv('MAIL_PORT'))  # SMTP port
     app.config['MAIL_USE_TLS'] = True  # Use TLS encryption
     app.config['MAIL_USE_SSL'] = False  # Disable SSL
-    app.config['MAIL_USERNAME'] = 'supersonicwisdom@gmail.com'  # Your email address
-    app.config['MAIL_PASSWORD'] = 'etse bozf cpcw eiup'
+    app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')  # Your email address
+    app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')  # Your email password
 
     # Initialize mail with the app
     mail.init_app(app)
