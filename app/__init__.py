@@ -8,11 +8,17 @@ import logging
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from datetime import timedelta
+from flask_mail import Mail, Message
+from flask_cors import CORS
 
 db = SQLAlchemy()
 
+mail = Mail()
+
 def create_app():
     app = Flask(__name__)
+
+    CORS(app)
     limiter = Limiter(get_remote_address, app=app, storage_uri="redis://localhost:6379",
   storage_options={"socket_connect_timeout": 30},
   strategy="fixed-window")
@@ -38,6 +44,17 @@ def create_app():
     app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
     app.config['JWT_BLACKLIST_ENABLED'] = True
     app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ["access", "refresh"]
+
+    # Set up Flask-Mail configuration
+    app.config['MAIL_SERVER'] = 'smtp.gmail.com'  # SMTP server address (use your email service provider's SMTP)
+    app.config['MAIL_PORT'] = 587  # SMTP port
+    app.config['MAIL_USE_TLS'] = True  # Use TLS encryption
+    app.config['MAIL_USE_SSL'] = False  # Disable SSL
+    app.config['MAIL_USERNAME'] = 'supersonicwisdom@gmail.com'  # Your email address
+    app.config['MAIL_PASSWORD'] = 'etse bozf cpcw eiup'
+
+    # Initialize mail with the app
+    mail.init_app(app)
     
     # Rest of your configurations...
     jwt = JWTManager(app)

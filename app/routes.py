@@ -1,10 +1,10 @@
 # flask-app/app/routes.py
 import os
 from flask import Blueprint, request, jsonify, session
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt, decode_token
 from .utils import (create_error_response, get_user_by_id, get_user_by_username, get_user_by_email,
                     get_student_by_registration, check_required_fields,
-                    get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db,
+                    get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db, send_reset_email,
                     process_uploaded_file, process_scores_data)
 from .models import User, db, Result, Student, Course, Semester, ActionLog, TokenBlacklist, Score
 from .constants import ALLOWED_ROLES, UPLOAD_FOLDER
@@ -12,7 +12,7 @@ from functools import wraps
 from flask_restx import Api, Resource, fields, Namespace
 import json
 from sqlalchemy.orm import joinedload
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import logging
 
@@ -38,12 +38,14 @@ auth_ns = Namespace('auth', description='Authentication operations')
 results_ns = Namespace('results', description='Results operations')
 course_ns = Namespace('courses', description='Course operations')
 student_ns = Namespace('students', description='Student operations')
+security_ns = Namespace('security', description='Security operations')
 
 # Add namespaces to API
 api.add_namespace(auth_ns)
 api.add_namespace(results_ns)
 api.add_namespace(course_ns)
 api.add_namespace(student_ns)
+api.add_namespace(security_ns)
 
 # Models for Swagger documentation
 user_model = api.model('User', {
@@ -323,12 +325,8 @@ class ForgotPassword(Resource):
         # Generate reset token (JWT with limited expiry)
         reset_token = create_access_token(identity=user.id, expires_delta=timedelta(hours=1))
 
-        # Send email with the reset token (implement `send_email`)
-        send_email(
-            to=email,
-            subject="Password Reset",
-            body=f"Use this token to reset your password: {reset_token}"
-        )
+        # Send email with the reset token
+        send_reset_email(email, reset_token)
 
         # Log action
         log = ActionLog(
@@ -345,11 +343,13 @@ class ForgotPassword(Resource):
 
         return {"message": "Password reset email sent"}, 200
 
+
 @auth_ns.route('/reset-password')
 class ResetPassword(Resource):
     @auth_ns.expect(reset_password_model)
     def post(self):
         """Reset user password"""
+        # Extract the token and new password from the payload
         data = request.json
         reset_token = data.get('reset_token')
         new_password = data.get('new_password')
@@ -358,6 +358,7 @@ class ResetPassword(Resource):
             return {"error": "Token and new password are required"}, 400
 
         try:
+            # Decode the token to get the user ID
             user_id = decode_token(reset_token)["sub"]
             user = get_user_by_id(user_id)
 
@@ -368,7 +369,7 @@ class ResetPassword(Resource):
             user.set_password(new_password)
             db.session.commit()
 
-            # Log action
+            # Log the action
             log = ActionLog(
                 user_id=user_id,
                 action="reset_password",
@@ -498,7 +499,6 @@ class ChangePassword(Resource):
 
         return {"message": "Password changed successfully"}, 200
 
-
 # Results routes
 @results_ns.route('/submit')
 class SubmitResults(Resource):
@@ -580,18 +580,21 @@ class SubmitResults(Resource):
 
             # Commit all changes
             db.session.commit()
-            # # Log action
-            # log = ActionLog(
-            #     user_id=user.id,
-            #     action="submit_result",
-            #     resource="Result",
-            #     resource_id=result.id,
-            #     details=json.dumps({"username": user.username}),
-            #     ip_address=request.remote_addr,
-            #     user_agent=request.headers.get('User-Agent')
-            # )
-            # db.session.add(log)
-            # db.session.commit()
+
+            # Log action for submitting results
+            current_user_id = get_jwt_identity()
+            log = ActionLog(
+                user_id=current_user_id,
+                action="submit_result",
+                resource="Result",
+                resource_id=result.id,
+                details=json.dumps({"course_code": data['course_code'], "semester_name": data['semester_name']}),
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent')
+            )
+            db.session.add(log)
+            db.session.commit()
+
             return {"message": "Results submitted successfully"}, 200
         except Exception as e:
             db.session.rollback()
@@ -628,15 +631,21 @@ class ResultListView(Resource):
             query = query.join(Course).filter(Course.department.ilike(f"%{department}%"))
         if course_code:
             query = query.join(Course).filter(Course.code.ilike(f"%{course_code}%"))
-        course = Course.query.filter_by(code=course_code).first()
-        if not course:
-            return {"error": "Course not found"}, 404
-        if current_user.role == 'lecturer' and current_user not in course.lecturers:
-            return {"error": "You are not authorized to access results for this course"}, 403
         if semester:
             query = query.join(Semester).filter(Semester.name.ilike(f"%{semester}%"))
         if session:
             query = query.join(Semester).filter(Semester.name.ilike(f"%{session}%"))
+
+        # Access Control: Lecturers can only view results they've submitted or the ones associated with courses they teach
+        current_user_id = get_jwt_identity()
+        current_user = User.query.get(current_user_id)
+
+        if current_user.role == 'lecturer':
+            # Check results that the lecturer has submitted or courses they are teaching
+            query = query.filter(
+                (Result.uploader_lecturer_id == current_user_id) |  # Submitted by lecturer
+                (Course.lecturers.any(id=current_user_id))  # Course lecturer
+            )
 
         # Fetch paginated results
         results = query.paginate(page=page, per_page=per_page, error_out=False)
@@ -653,7 +662,7 @@ class ResultListView(Resource):
                 "upload_date": result.upload_date.isoformat() if result.upload_date else None,
                 "department": result.course.department,
                 "faculty": result.course.faculty,
-                "num_scores": len(result.scores)
+                "num_scores": len(result.scores)  # Count of scores associated with the result
             })
 
         return {
@@ -676,11 +685,19 @@ class ResultDetailView(Resource):
         if not result:
             return {"error": "Result not found"}, 404
 
-        # Fetch the associated scores for the result
-        scores = Score.query.filter_by(result_id=result.id).all()
+        # Access Control: Lecturers can only view results they've submitted or courses they teach
+        current_user_id = get_jwt_identity()
+        current_user = User.query.get(current_user_id)
+
+        if current_user.role == 'lecturer':
+            if result.uploader_lecturer_id != current_user_id and current_user not in result.course.lecturers:
+                return {"error": "You are not authorized to view this result"}, 403
+
+        # Fetch the associated scores for the result, sorted by student name
+        scores = sorted(result.scores, key=lambda x: x.student.name.lower())  # Sorting by student name A-Z
 
         # Prepare the response
-        return {
+        response = {
             "id": result.id,
             "course_code": result.course.code,
             "course_title": result.course.title,
@@ -699,7 +716,22 @@ class ResultDetailView(Resource):
                     "grade": score.grade
                 } for score in scores
             ]
-        }, 200
+        }
+
+        # Log the action for viewing result details
+        log = ActionLog(
+            user_id=current_user_id,
+            action="view_result_detail",
+            resource="Result",
+            resource_id=result.id,
+            details=json.dumps({"course_code": result.course.code, "semester_name": result.semester.name}),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return response, 200
 
 @results_ns.route('/by-registration')
 class ResultsByRegistration(Resource):
@@ -812,6 +844,13 @@ class UpdateOrCreateScore(Resource):
         if not result:
             return {"error": f"Result with ID {result_id} not found"}, 404
 
+        current_user_id = get_jwt_identity()
+        current_user = User.query.get(current_user_id)
+
+        # Ensure the lecturer is either the uploader or affiliated with the course
+        if result.uploader_lecturer_id != current_user_id or current_user not in result.course.lecturers:
+            return {"error": "You are not authorized to update this result."}, 403
+
         # Fetch or create the student
         student = Student.query.filter_by(registration_number=registration_number).first()
         if not student:
@@ -855,7 +894,6 @@ class UpdateOrCreateScore(Resource):
             db.session.commit()
 
             # Log the action
-            current_user_id = get_jwt_identity()
             log = ActionLog(
                 user_id=current_user_id,
                 action="update_or_create_score",
@@ -889,6 +927,13 @@ class UpdateResultMeta(Resource):
         result = Result.query.get(result_id)
         if not result:
             return {"error": f"Result with ID {result_id} not found."}, 404
+
+        current_user_id = get_jwt_identity()
+        current_user = User.query.get(current_user_id)
+
+        # Ensure the lecturer is either the uploader or affiliated with the course
+        if result.uploader_lecturer_id != current_user_id or current_user not in result.course.lecturers:
+            return {"error": "You are not authorized to update this result metadata."}, 403
 
         # Dynamically set the uploader_lecturer_id from the current user (using JWT)
         uploader_lecturer_id = get_jwt_identity()
@@ -1107,6 +1152,7 @@ class UploadResults(Resource):
             return {"error": error}, 400
 
         try:
+            # Process the file
             extraction_result, message = process_uploaded_file(filepath)
             if extraction_result is None:
                 return {"error": message}, 400
@@ -1114,12 +1160,32 @@ class UploadResults(Resource):
             header_info, results_data = extraction_result
             uploader_id = get_jwt_identity()
 
+            # Fetch or create the course
+            course = Course.query.filter_by(code=header_info['course_code']).first()
+
+            if not course:
+                # If course doesn't exist, create it
+                course = Course(
+                    code=header_info['course_code'],
+                    title=header_info['course_title'],
+                    unit=header_info['course_unit'],
+                    department=header_info['department'],
+                    faculty=header_info['faculty'],
+                    level='100'  # You can adjust this based on your payload data
+                )
+                db.session.add(course)
+                db.session.flush()  # Ensure the course ID is available
+
+            current_user = User.query.get(uploader_id)
+            if current_user.role == 'lecturer' and current_user not in course.lecturers:
+                return {"error": "You are not authorized to upload results for this course."}, 403
+
+            # Save extracted data to the database
             file_info = {
                 'filename': file.filename,
                 'uploader_id': uploader_id
             }
 
-            # Save extracted data to the database
             success, db_message = save_results_to_db(header_info, results_data, file_info)
             if not success:
                 return {"error": db_message}, 500
@@ -1127,6 +1193,54 @@ class UploadResults(Resource):
             return {
                 "message": "File processed and results saved successfully",
                 "records": len(results_data)
+            }, 200
+
+        except Exception as e:
+            return {"error": str(e)}, 500
+
+
+
+from sqlalchemy.orm import joinedload
+
+@security_ns.route('/action-logs')
+class ActionLogView(Resource):
+    @security_ns.response(200, 'Action logs retrieved successfully')
+    @security_ns.response(403, 'Forbidden')
+    @security_ns.doc(security='Bearer')
+    @jwt_role_required('hod', 'admin')  # Only HODs and Admins can access this
+    def get(self):
+        """Get all action logs."""
+        # Pagination parameters
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+
+        try:
+            # Fetch paginated action logs and ensure the 'user' relationship is eagerly loaded
+            action_logs = ActionLog.query.options(joinedload(ActionLog.user)).order_by(ActionLog.timestamp.desc()).paginate(page=page, per_page=per_page, error_out=False)
+
+            # Prepare the response data
+            logs_data = []
+            for log in action_logs.items:
+                logs_data.append({
+                    "id": log.id,
+                    "user_id": log.user_id,
+                    "username": log.user.username if log.user else None,  # Safely access the 'username'
+                    "action": log.action,
+                    "resource": log.resource,
+                    "resource_id": log.resource_id,
+                    "details": log.details,
+                    "timestamp": log.timestamp.isoformat(),
+                    "ip_address": log.ip_address,
+                    "user_agent": log.user_agent
+                })
+
+            # Return the action logs with pagination info
+            return {
+                "action_logs": logs_data,
+                "total_results": action_logs.total,
+                "current_page": action_logs.page,
+                "total_pages": action_logs.pages,
+                "per_page": action_logs.per_page
             }, 200
 
         except Exception as e:

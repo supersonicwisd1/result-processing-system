@@ -10,6 +10,9 @@ from datetime import datetime
 import os
 from werkzeug.utils import secure_filename
 from .extraction import *
+from app import mail
+from flask_mail import Message
+from flask import render_template
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'csv', 'xls', 'xlsx', 'docx', 'pdf'}
@@ -143,7 +146,7 @@ def save_results_to_db(header_info, results_data, file_info):
                 unit=header_info['course_unit'],
                 department=header_info['department'],
                 faculty=header_info['faculty'],
-                level='100'
+                level='100'  # You can adjust this based on your payload data
             )
             db.session.add(course)
             db.session.flush()
@@ -162,7 +165,7 @@ def save_results_to_db(header_info, results_data, file_info):
             student = Student.query.filter_by(
                 registration_number=result['registration_number']
             ).first()
-            
+
             if not student:
                 student = Student(
                     registration_number=result['registration_number'],
@@ -174,14 +177,12 @@ def save_results_to_db(header_info, results_data, file_info):
 
             # Create or update result metadata
             result_metadata = Result.query.filter_by(
-                student_id=student.id,
                 course_id=course.id,
-                semester_id=semester.id
+                semester_id=semester.id,
             ).first()
 
             if not result_metadata:
                 result_metadata = Result(
-                    student_id=student.id,
                     course_id=course.id,
                     semester_id=semester.id,
                     original_file=file_info['filename'],
@@ -192,7 +193,7 @@ def save_results_to_db(header_info, results_data, file_info):
                 db.session.flush()
 
             # Create or update score
-            score = Score.query.filter_by(result_id=result_metadata.id).first()
+            score = Score.query.filter_by(result_id=result_metadata.id, student_id=student.id).first()
             if score:
                 score.continuous_assessment = result['continuous_assessment']
                 score.exam_score = result['exam_score']
@@ -201,6 +202,7 @@ def save_results_to_db(header_info, results_data, file_info):
             else:
                 score = Score(
                     result_id=result_metadata.id,
+                    student_id=student.id,
                     continuous_assessment=result['continuous_assessment'],
                     exam_score=result['exam_score'],
                     total_score=result['total_score'],
@@ -225,18 +227,6 @@ def save_file(file):
     return filepath, None
 
 def process_scores_data(scores):
-    """
-    Processes student scores to calculate GPA and group data by session and semester.
-
-    Args:
-        scores (list): A list of `Score` objects with their related `Result`, `Course`, and `Semester`.
-
-    Returns:
-        tuple: A tuple containing:
-            - grouped_scores (dict): Scores grouped by session and semester with GPA and course details.
-            - overall_total_credit_earned (int): Total credits earned across all sessions and semesters.
-            - overall_total_grade_point (float): Total grade points across all sessions and semesters.
-    """
     grouped_scores = {}
     overall_total_credit_earned = 0
     overall_total_grade_point = 0
@@ -299,3 +289,13 @@ def process_scores_data(scores):
 
     return grouped_scores, overall_total_credit_earned, overall_total_grade_point
 
+def send_reset_email(to_email, reset_token):
+    try:
+        reset_url = f"http://localhost:5000/api/v1/auth/reset-password?token={reset_token}"
+        msg = Message('Password Reset Request', recipients=[to_email])
+        msg.body = f'Use this reset token to reset your password: {reset_token}'
+        # msg.html = f'<p>Click the link below to reset your password:</p><p><a href="{reset_url}">Reset Password</a></p>'
+        msg.sender = "supersonicwisdom@gmail.com"
+        mail.send(msg)
+    except Exception as e:
+        print(f"Error sending email: {e}")
