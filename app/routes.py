@@ -147,28 +147,40 @@ def jwt_required(*args, **kwargs):
     return wrapper  
 
 # Authorization decorator  
-def role_required(*roles):  
-    def decorator(f):  
-        @wraps(f)  
-        def decorated_function(*args, **kwargs):  
-            current_user_id = get_jwt_identity()  
-            current_user = User.query.get(current_user_id)  # Adjust based on your User model  
-            if current_user is None or current_user.role not in roles:  
-                return {"error": "You are not authorized to access this resource"}, 403  
-            return f(*args, **kwargs)  
-        return decorated_function  
-    return decorator  
+# Role-based access control decorator
+def role_required(*roles):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # Verify JWT and extract the current user's identity
+            verify_jwt_in_request()  
+            current_user_id = get_jwt_identity()
+            
+            # Fetch the current user (adjust based on your User model)
+            current_user = User.query.get(current_user_id)
+            if current_user is None or current_user.role not in roles:
+                return {"error": "You are not authorized to access this resource"}, 403
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-# JWT role decorator  
-def jwt_role_required(*roles):  
-    def wrapper(fn):  
-        @wraps(fn)  
-        @jwt_required()  # Use the updated jwt_required  
-        @role_required(*roles)  
-        def decorated(*args, **kwargs):  
-            return fn(*args, **kwargs)  
-        return decorated  
-    return wrapper
+# JWT role decorator (combines JWT verification and role checks)
+def jwt_role_required(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Verify JWT before proceeding
+            verify_jwt_in_request()
+            
+            # Apply role-based access control
+            @role_required(*roles)
+            def secured_function(*args, **kwargs):
+                return fn(*args, **kwargs)
+            
+            return secured_function(*args, **kwargs)
+        return wrapper
+    return decorator
 
 # Authentication routes
 @auth_ns.route('/register')
