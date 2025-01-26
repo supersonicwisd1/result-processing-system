@@ -687,6 +687,13 @@ This document provides a detailed overview of the backend API endpoints, includi
 - **Endpoint:** `GET /api/v1/security/action-logs`
 - **Description:** Retrieves action logs (e.g., user actions) with pagination.
 - **Role Access:** Admin, HOD.
+- **Query Parameters:**
+
+| Parameter        | Type   | Description                                |
+|------------------|--------|--------------------------------------------|
+| page             | int    | Page number for pagination.               |
+| per_page         | int    | Number of results per page.               |
+
 - **Response:**
 
 | Status Code | Message                         |

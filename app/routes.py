@@ -1238,6 +1238,10 @@ from sqlalchemy.orm import joinedload
 
 @security_ns.route('/action-logs')
 class ActionLogView(Resource):
+    @results_ns.doc(params={
+        'page': 'Page number for pagination (optional, default=1)',
+        'per_page': 'Number of results per page (optional, default=10)'
+    })
     @security_ns.response(200, 'Action logs retrieved successfully')
     @security_ns.response(403, 'Forbidden')
     @security_ns.doc(security='Bearer')
