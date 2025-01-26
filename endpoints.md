@@ -632,7 +632,7 @@ This document provides a detailed overview of the backend API endpoints, includi
 
 ---
 
-### 12. **Delete Result**
+### 8. **Delete Result**
 
 - **Endpoint:** `DELETE /api/v1/results/delete/<int:result_id>`
 - **Description:** Deletes a result by its ID, including associated scores.
@@ -653,7 +653,7 @@ This document provides a detailed overview of the backend API endpoints, includi
 
 ---
 
-### 13. **Upload Results**
+### 9. **Upload Results**
 
 - **Endpoint:** `POST /api/v1/results/upload`
 - **Description:** Uploads and processes a results file (e.g., CSV, XLSX, DOCX).
@@ -682,7 +682,7 @@ This document provides a detailed overview of the backend API endpoints, includi
 
 ---
 
-### 14. **Get Action Logs**
+### 10. **Get Action Logs**
 
 - **Endpoint:** `GET /api/v1/security/action-logs`
 - **Description:** Retrieves action logs (e.g., user actions) with pagination.
@@ -717,4 +717,9 @@ This document provides a detailed overview of the backend API endpoints, includi
   "per_page": 10
 }
 ```
+
+### BASE_URL =  https://kene.pythonanywhere.com/
+
+### Swagger Doc = https://kene.pythonanywhere.com/docs
+
 ---
