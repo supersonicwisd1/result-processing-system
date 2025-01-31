@@ -10,7 +10,7 @@ from flask_limiter.util import get_remote_address
 from datetime import timedelta
 from flask_mail import Mail, Message
 from flask_cors import CORS
-from flask_migrate import Migrate  
+from flask_migrate import Migrate
 
 db = SQLAlchemy()
 
@@ -29,7 +29,7 @@ def create_app():
     # Configure logging
     logging.basicConfig(level=logging.INFO)
     app.logger.setLevel(logging.INFO)
-    
+
     env = os.getenv('FLASK_ENV', 'development')
     if env == 'production':
         app.config.from_object(ProductionConfig)
@@ -49,19 +49,19 @@ def create_app():
     app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ["access", "refresh"]
 
     # Set up Flask-Mail configuration
-    app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER')  # SMTP server address (use your email service provider's SMTP)
-    app.config['MAIL_PORT'] = 587  # SMTP port
+    app.config['MAIL_SERVER'] = "sandbox.smtp.mailtrap.io"  # SMTP server address (use your email service provider's SMTP)
+    app.config['MAIL_PORT'] = 2525  # SMTP port
     app.config['MAIL_USE_TLS'] = True  # Use TLS encryption
     app.config['MAIL_USE_SSL'] = False  # Disable SSL
-    app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')  # Your email address
-    app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')  # Your email password
+    app.config['MAIL_USERNAME'] = "28c710c4b872dc"  # Your email address
+    app.config['MAIL_PASSWORD'] = "a8c88bec17be5a"  # Your email password
 
     # Initialize mail with the app
     mail.init_app(app)
-    
+
     # Rest of your configurations...
     jwt = JWTManager(app)
-    
+
     # Add this JWT callback
     @jwt.user_identity_loader
     def user_identity_lookup(user):

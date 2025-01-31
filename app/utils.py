@@ -13,6 +13,7 @@ from .extraction import *
 from app import mail
 from flask_mail import Message
 from flask import render_template
+import requests
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'csv', 'xls', 'xlsx', 'docx', 'pdf'}
@@ -92,8 +93,8 @@ def process_result(result_data, course, semester, lecturer_id):
         db.session.flush()
 
     result = Result.query.filter_by(
-        student_id=student.id, 
-        course_id=course.id, 
+        student_id=student.id,
+        course_id=course.id,
         semester_id=semester.id
     ).first()
 
@@ -131,7 +132,7 @@ def process_uploaded_file(filepath):
         elif ext == ".xlsx":
             return extract_xlsx_data(filepath), "XLSX file processed"
         else:
-            return None, "Unsupported file format"  
+            return None, "Unsupported file format"
     except Exception as e:
         return None, str(e)
 
@@ -298,3 +299,114 @@ def send_otp_email(to_email, otp):
         mail.send(msg)
     except Exception as e:
         print(f"Error sending email: {e}")
+
+# def send_otp_email(to_email, otp):
+#   	return requests.post(
+#   		"https://api.mailgun.net/v3/sandbox91cbd5d5c8ea4596955797b6c98f1fc0.mailgun.org/messages",
+#   		auth=("api", "CDD65B3C7816DF5A4F585FDED423D7156819BD87457AA358C48138C47022E50C6807C91C465A959CAD7A5DF9F899FCDA
+# "),
+#   		data={"from": "Excited User <mailgun@sandbox91cbd5d5c8ea4596955797b6c98f1fc0.mailgun.org>",
+#   			"to": [to_email, "supersonicwisdom@gmail.com"],
+#   			"subject": "Password Reset Request",
+#   			"text": f"Use this OTP to reset your password: {otp}"})
+
+
+# def send_otp_email(to_email, otp):
+
+#     api_key = 'CDD65B3C7816DF5A4F585FDED423D7156819BD87457AA358C48138C47022E50C6807C91C465A959CAD7A5DF9F899FCDA'
+#     url = 'https://api.elasticemail.com/v2/email/send'
+
+#     data = {
+#         'apikey': api_key,
+#         'from': 'supersonicwisdom@gmail.com',
+#         'to': to_email,
+#         'subject': 'Password Reset Request',
+#         'bodyHtml': f'<html><body><h1>Use this OTP to reset your password: {otp}</h1></body></html>',
+#         'isTransactional': True
+#     }
+
+#     response = requests.post(url, data=data)
+
+#     if response.status_code == 200:
+#         print("Email sent successfully!")
+#     else:
+#         print("Failed to send email:", response.json())
+
+
+# import ElasticEmail
+# from ElasticEmail.api import emails_api
+# from ElasticEmail.model.email_content import EmailContent
+# from ElasticEmail.model.body_part import BodyPart
+# from ElasticEmail.model.body_content_type import BodyContentType
+# from ElasticEmail.model.email_recipient import EmailRecipient
+# from ElasticEmail.model.email_message_data import EmailMessageData
+# from pprint import pprint
+
+# configuration = ElasticEmail.Configuration()
+# configuration.api_key['apikey'] = 'CDD65B3C7816DF5A4F585FDED423D7156819BD87457AA358C48138C47022E50C6807C91C465A959CAD7A5DF9F899FCDA'
+
+# def send_otp_email(to_email, otp):
+#     with ElasticEmail.ApiClient(configuration) as api_client:
+#         # Create an instance of the API class
+#         api_instance = emails_api.EmailsApi(api_client)
+#         email_message_data = EmailMessageData(
+#             Recipients=[
+#                 EmailRecipient(
+#                     email= to_email,
+#                     # fields={
+#                     #     "name": "UNN",
+#                     # },
+#                 ),
+#             ],
+#             Content=EmailContent(
+#                 body=[
+#                     # BodyPart(
+#                     #     ContentType=BodyContentType("HTML"),
+#                     #     Content=f"<strong>Use this OTP to reset your password: {otp}<strong>",
+#                     #     Charset="utf-8",
+#                     # ),
+#                     BodyPart(
+#                         ContentType=BodyContentType("PlainText"),
+#                         Content=f"Hi! \nUse this OTP to reset your password: {otp}",
+#                         Charset="utf-8",
+#                     ),
+#                 ],
+#                 From="supersonicwisdom@gmail.com",
+#                 ReplyTo= to_email,
+#                 Subject="Password Reset Request",
+#             ),
+#         ) # EmailMessageData | Email data
+
+#         try:
+#             # Send Bulk Emails
+#             api_response = api_instance.emails_post(email_message_data)
+#             pprint(api_response)
+#         except ElasticEmail.ApiException as e:
+#             print("Exception when calling EmailsApi->emails_post: %s\n" % e)
+
+    # with ElasticEmail.ApiClient(configuration) as api_client:
+    #     api_instance = emails_api.EmailsApi(api_client)
+    #     email_message_data = EmailMessageData(
+    #         recipients=[
+    #             EmailRecipient(
+    #                 email= to_email
+    #             ),
+    #         ],
+    #         content={
+    # 	    "Body": [
+    # 		{
+    # 		    "ContentType":"HTML",
+    # 		    "Content":f"Use this OTP to reset your password: {otp})"
+    # 		}
+    # 	    ],
+    # 	    "Subject": "Password Reset Request",
+    # 	    "From": "supersonicwisdom@gmail.com "
+    # 	}
+    #     )
+
+    #     try:
+    #         api_response = api_instance.emails_post(email_message_data)
+    #         pprint(api_response)
+    #     except ElasticEmail.ApiException as e:
+    #         print("Exception when calling EmailsApi->emails_post: %s\n" % e)
+
