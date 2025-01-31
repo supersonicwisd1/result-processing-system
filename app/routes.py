@@ -1,7 +1,7 @@
 # flask-app/app/routes.py
 import os
 from flask import Blueprint, request, jsonify, session, abort
-from flask_jwt_extended import create_access_token, jwt_required as original_jwt_required, get_jwt_identity, get_jwt, decode_token, verify_jwt_in_request
+from flask_jwt_extended import create_access_token, jwt_required as original_jwt_required, get_jwt_identity, get_jwt, decode_token, verify_jwt_in_request, create_refresh_token
 from .utils import (create_error_response, get_user_by_id, get_user_by_username, get_user_by_email,
                     get_student_by_registration, check_required_fields,
                     get_or_create_course, get_or_create_semester, process_result, save_file, save_results_to_db, send_otp_email,
@@ -15,6 +15,9 @@ from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 import random
 import string
+from flask import Response
+from fpdf import FPDF
+import re
 
 import logging
 
@@ -200,6 +203,12 @@ class Register(Resource):
 
         if not username or not password or not role:
             return create_error_response("Username, password, and role are required")
+        if not (len(password) >= 8):  
+            return {'error': 'Invalid because the password is too short'}   
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):  
+            return {'error': "Invalid because there's no special character"} 
+        if not re.search(r'[A-Z]', password):  
+            return {'error': "Invalid because there's no uppercase letter"}   
         if role not in ALLOWED_ROLES:
             return create_error_response(f"Invalid role. Allowed roles are {', '.join(ALLOWED_ROLES)}")
 
@@ -245,6 +254,7 @@ class Login(Resource):
         user = get_user_by_username(username) if username else get_user_by_email(email)
         if user and user.check_password(password):
             access_token = create_access_token(identity=user.id)
+            refresh_token = create_refresh_token(identity=user.id)
 
             # Log action
             log = ActionLog(
@@ -259,7 +269,7 @@ class Login(Resource):
             db.session.add(log)
             db.session.commit()
 
-            return {"access_token": access_token, "role": user.role}, 200
+            return {"access_token": access_token, "refresh_token": refresh_token, "role": user.role}, 200
 
         return {"error": "Invalid credentials"}, 401
 
@@ -297,7 +307,7 @@ class RefreshToken(Resource):
     def post(self):
         """Refresh access token"""
         current_user_id = get_jwt_identity()
-        access_token = create_access_token(identity=current_user_id)
+        access_token = create_access_token(identity=current_user_id)  # Generate ONLY access token
 
         # Log action
         log = ActionLog(
@@ -311,7 +321,7 @@ class RefreshToken(Resource):
         db.session.add(log)
         db.session.commit()
 
-        return {"access_token": access_token}, 200
+        return {"access_token": access_token}, 200  # Only return access token
 
 @auth_ns.route('/me')
 class Me(Resource):
@@ -641,7 +651,7 @@ class SubmitResults(Resource):
             db.session.add(log)
             db.session.commit()
 
-            return {"message": "Results submitted successfully"}, 200
+            return {"message": "Results submitted successfully", "result": result.id}, 200
         except Exception as e:
             db.session.rollback()
             return {"error": str(e)}, 500
@@ -703,7 +713,8 @@ class ResultListView(Resource):
                 "id": result.id,
                 "course_code": result.course.code,
                 "course_title": result.course.title,
-                "semester": result.semester.name,
+                "semester": result.semester.name.split()[1],
+                "session": result.semester.name.split()[0],
                 "uploaded_by": result.uploader.username,
                 "upload_date": result.upload_date.isoformat() if result.upload_date else None,
                 "department": result.course.department,
@@ -747,7 +758,8 @@ class ResultDetailView(Resource):
             "id": result.id,
             "course_code": result.course.code,
             "course_title": result.course.title,
-            "semester": result.semester.name,
+            "semester": result.semester.name.split()[1],
+            "session": result.semester.name.split()[0],
             "uploaded_by": result.uploader.username,
             "upload_date": result.upload_date.isoformat() if result.upload_date else None,  # Serialize datetime
             "department": result.course.department,
@@ -869,21 +881,119 @@ class ResultsByRegistration(Resource):
             "results": session_results
         }, 200
 
-@results_ns.route('/<int:result_id>/update-score')
-class UpdateOrCreateScore(Resource):
-    @results_ns.expect(score_update_model)
-    @results_ns.response(200, 'Score updated or created successfully')
+
+@results_ns.route('/by-registration/download')
+class DownloadStudentTranscript(Resource):
+    @results_ns.doc(params={
+        'registration_number': 'Student registration number (required)',
+        'session': 'Academic session (optional)'
+    })
+    @results_ns.response(200, 'Transcript generated successfully')
+    @results_ns.response(404, 'Student not found')
+    @results_ns.response(400, 'Missing required parameters')
+    @results_ns.produces(['application/pdf'])
+    @jwt_role_required('hod', 'exam_officer')
+    def get(self):
+        """Download student transcript as a PDF including CA score, Exam score, and Semester GPA"""
+        registration_number = request.args.get('registration_number')
+        session = request.args.get('session')
+
+        if not registration_number:
+            return {"error": "Missing required query parameter: registration_number"}, 400
+
+        student = get_student_by_registration(registration_number)
+        if not student:
+            return {"error": f"Student with registration number '{registration_number}' not found."}, 404
+
+        query = Score.query.options(
+            joinedload(Score.result).joinedload(Result.course),
+            joinedload(Score.result).joinedload(Result.semester)
+        ).filter(Score.student_id == student.id)
+
+        if session:
+            query = query.join(Result.semester).filter(Semester.name.like(f'{session}%'))
+
+        scores = query.all()
+
+        if not scores:
+            return {"error": f"No results found for student '{registration_number}'."}, 404
+
+        # Process data
+        grouped_results, total_credit_earned, total_grade_point = process_scores_data(scores)
+
+        # Debugging: Print grouped_results structure
+        print("DEBUG: grouped_results structure:", grouped_results)
+
+        # Ensure safe defaults for total_credit_earned & total_grade_point
+        total_credit_earned = total_credit_earned or 0
+        total_grade_point = total_grade_point or 0
+        cgpa = round(total_grade_point / total_credit_earned, 2) if total_credit_earned > 0 else 0
+
+        # Create PDF
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Arial", style='B', size=16)
+        pdf.cell(200, 10, "Student Transcript", ln=True, align='C')
+        pdf.ln(10)
+
+        # Student Details
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, f"Name: {student.name}", ln=True)
+        pdf.cell(0, 10, f"Registration Number: {student.registration_number}", ln=True)
+        pdf.cell(0, 10, f"Session: {session if session else 'All Sessions'}", ln=True)
+        pdf.cell(0, 10, f"CGPA: {cgpa}", ln=True)
+        pdf.ln(10)
+
+        # Results with CA Score, Exam Score, and Semester GPA
+        for session_name, session_data in grouped_results.items():  
+            pdf.set_font("Arial", style='B', size=12)
+            pdf.cell(0, 10, f"Session: {session_name}", ln=True)
+            pdf.set_font("Arial", size=11)
+
+            for semester, semester_data in session_data.get("results_by_semester", {}).items():
+                semester_gpa = semester_data.get("GPA", round(semester_data["total_grade_point"] / semester_data["total_credit_earned"], 2) if semester_data["total_credit_earned"] > 0 else 0)
+
+                pdf.cell(0, 8, f"  Semester: {semester} (GPA: {semester_gpa})", ln=True)
+                pdf.cell(30, 8, "Course Code", border=1)
+                pdf.cell(70, 8, "Course Title", border=1)
+                pdf.cell(20, 8, "CA Score", border=1)
+                pdf.cell(20, 8, "E.Score", border=1)
+                pdf.cell(20, 8, "T.Score", border=1)
+                pdf.cell(20, 8, "Grade", border=1)
+                pdf.ln()
+
+                for course in semester_data["courses"]:
+                    pdf.cell(30, 8, course["course_code"], border=1)
+                    pdf.cell(70, 8, course["course_title"], border=1)
+                    pdf.cell(20, 8, str(course["ca_score"]), border=1)
+                    pdf.cell(20, 8, str(course["exam_score"]), border=1)
+                    pdf.cell(20, 8, str(course["total_score"]), border=1)
+                    pdf.cell(20, 8, course["grade"], border=1)
+                    pdf.ln()
+
+                pdf.cell(0, 8, f"  Total Credit Earned: {semester_data['total_credit_earned']}", ln=True)
+                pdf.cell(0, 8, f"  Total Grade Point: {semester_data['total_grade_point']}", ln=True)
+                pdf.ln(5)
+
+        # Output as a response
+        response = Response(pdf.output(dest='S').encode('latin1'), mimetype='application/pdf')
+        response.headers['Content-Disposition'] = f'attachment; filename={student.registration_number}_transcript.pdf'
+        return response
+
+@results_ns.route('/<int:result_id>/update-scores')
+class UpdateOrCreateScores(Resource):
+    @results_ns.expect([score_update_model])  # Expecting a list of score update models
+    @results_ns.response(200, 'Scores updated or created successfully')
     @results_ns.response(404, 'Result or student not found')
     @results_ns.response(400, 'Invalid request payload')
     @jwt_role_required('hod', 'exam_officer', 'lecturer')
     def patch(self, result_id):
-        """Update or create a score for a result, including adding a new student"""
+        """Update or create scores for multiple results, including adding new students"""
         data = request.json
 
-        # Validate required parameters
-        registration_number = data.get("registration_number")
-        if not registration_number:
-            return {"error": "Registration number is required"}, 400
+        if not isinstance(data, list):
+            return {"error": "Request payload must be a list of score objects"}, 400
 
         # Validate if the result exists
         result = Result.query.get(result_id)
@@ -894,57 +1004,60 @@ class UpdateOrCreateScore(Resource):
         current_user = User.query.get(current_user_id)
 
         # Ensure the lecturer is either the uploader or affiliated with the course
-        if result.uploader_lecturer_id != current_user_id or current_user not in result.course.lecturers:
-            return {"error": "You are not authorized to update this result."}, 403
-
-        # Fetch or create the student
-        student = Student.query.filter_by(registration_number=registration_number).first()
-        if not student:
-            # If the student doesn't exist, create a new student
-            if not data.get("student_name"):
-                return {"error": "Student name is required for new students"}, 400
-            student = Student(
-                registration_number=registration_number,
-                name=data["student_name"],
-                department=result.course.department  # Use the department linked to the course
-            )
-            db.session.add(student)
-            db.session.flush()  # Get the `student.id` before proceeding
-
-        # Fetch or create the score
-        score = Score.query.filter_by(result_id=result.id, student_id=student.id).first()
-        if not score:
-            # Create a new score if it doesn't exist
-            score = Score(
-                result_id=result.id,
-                student_id=student.id
-            )
-            db.session.add(score)
+        # if result.uploader_lecturer_id != current_user_id or current_user not in result.course.lecturers:
+        #     return {"error": "You are not authorized to update this result."}, 403
 
         try:
-            # Update fields if provided in the payload
-            if "ca_score" in data:
-                score.continuous_assessment = data["ca_score"]
-            if "exam_score" in data:
-                score.exam_score = data["exam_score"]
-            if "total_score" in data:
-                score.total_score = data["total_score"]
-            else:
-                # Calculate total_score automatically if ca_score or exam_score is updated
-                score.total_score = score.continuous_assessment + score.exam_score
+            for item in data:
+                registration_number = item.get("registration_number")
+                if not registration_number:
+                    return {"error": "Registration number is required for each score object"}, 400
 
-            if "grade" in data:
-                score.grade = data["grade"]
+                # Fetch or create the student
+                student = Student.query.filter_by(registration_number=registration_number).first()
+                if not student:
+                    if not item.get("student_name"):
+                        return {"error": f"Student name is required for new student with registration number {registration_number}"}, 400
+                    student = Student(
+                        registration_number=registration_number,
+                        name=item["student_name"],
+                        department=result.course.department
+                    )
+                    db.session.add(student)
+                    db.session.flush()  # Get the `student.id` before proceeding
 
-            # Commit changes
+                # Fetch or create the score
+                score = Score.query.filter_by(result_id=result.id, student_id=student.id).first()
+                if not score:
+                    score = Score(
+                        result_id=result.id,
+                        student_id=student.id
+                    )
+                    db.session.add(score)
+
+                # Update fields if provided in the payload
+                if "ca_score" in item:
+                    score.continuous_assessment = item["ca_score"]
+                if "exam_score" in item:
+                    score.exam_score = item["exam_score"]
+                if "total_score" in item:
+                    score.total_score = item["total_score"]
+                else:
+                    # Calculate total_score automatically if ca_score or exam_score is updated
+                    score.total_score = score.continuous_assessment + score.exam_score
+
+                if "grade" in item:
+                    score.grade = item["grade"]
+
+            # Commit changes after processing all items
             db.session.commit()
 
             # Log the action
             log = ActionLog(
                 user_id=current_user_id,
-                action="update_or_create_score",
+                action="update_or_create_scores",
                 resource="Score",
-                resource_id=score.id,
+                resource_id=result.id,
                 details=json.dumps(data),
                 ip_address=request.remote_addr,
                 user_agent=request.headers.get('User-Agent')
@@ -952,7 +1065,7 @@ class UpdateOrCreateScore(Resource):
             db.session.add(log)
             db.session.commit()
 
-            return {"message": "Score updated or created successfully"}, 200
+            return {"message": "Scores updated or created successfully"}, 200
 
         except Exception as e:
             db.session.rollback()
@@ -974,51 +1087,51 @@ class UpdateResultMeta(Resource):
         if not result:
             return {"error": f"Result with ID {result_id} not found."}, 404
 
-        current_user_id = get_jwt_identity()
-        current_user = User.query.get(current_user_id)
-
-        # Ensure the lecturer is either the uploader or affiliated with the course
-        if result.uploader_lecturer_id != current_user_id or current_user not in result.course.lecturers:
-            return {"error": "You are not authorized to update this result metadata."}, 403
-
-        # Dynamically set the uploader_lecturer_id from the current user (using JWT)
         uploader_lecturer_id = get_jwt_identity()
 
-        # Update fields dynamically if present in the payload
         try:
-            # Check and update course code if provided
+            # Handle course update or creation
             if "course_code" in data:
                 course = Course.query.filter_by(code=data["course_code"]).first()
                 if not course:
-                    return {"error": f"Course with code '{data['course_code']}' not found."}, 404
+                    course = Course(
+                        code=data["course_code"],
+                        title=data.get("course_title", ""),  # Default empty title if not provided
+                        unit=data.get("course_unit", 0),  # Default unit 0 if not provided
+                        department=data.get("department", "")  # Set department if provided
+                    )
+                    db.session.add(course)
+                    db.session.flush()  # Ensure the course has an ID before linking it
                 result.course_id = course.id
 
-            # Check and update semester and session if provided
+            # Handle semester update or creation
             if "semester_name" in data and "session" in data:
-                semester_name = f"{data['session']} {data['semester_name']}"
+                semester_name = f"{data['session']} {data['semester_name']}"  # Format: 2019/2020 Second
                 semester = Semester.query.filter_by(name=semester_name).first()
                 if not semester:
-                    return {"error": f"Semester '{semester_name}' not found."}, 404
+                    semester = Semester(name=semester_name)
+                    db.session.add(semester)
+                    db.session.flush()
                 result.semester_id = semester.id
 
-            # Update course title and unit if provided
+            # Update course title and unit
             if "course_title" in data:
                 result.course.title = data["course_title"]
             if "course_unit" in data:
                 result.course.unit = data["course_unit"]
 
-            # Update department if provided
+            # Update department directly in the Course model
             if "department" in data:
                 result.course.department = data["department"]
 
-            # If uploader_lecturer_id is provided, update it
+            # Update uploader_lecturer_id
             result.uploader_lecturer_id = uploader_lecturer_id
 
-            # Optionally update the original file if provided
+            # Optionally update the original file
             if "original_file" in data:
                 result.original_file = data["original_file"]
 
-            # Commit the updates
+            # Commit changes
             db.session.commit()
 
             # Log the action
@@ -1096,7 +1209,8 @@ class SearchResults(Resource):
                 "id": result.id,
                 "course_code": result.course.code,
                 "course_title": result.course.title,
-                "semester": result.semester.name,
+                "semester": result.semester.name.split()[1],
+                "session": result.semester.name.split()[0],
                 "department": result.course.department,
                 "faculty": result.course.faculty,
                 "upload_date": result.upload_date.isoformat() if result.upload_date else None,
